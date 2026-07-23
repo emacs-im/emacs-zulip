@@ -40,6 +40,21 @@
                     (buffer-live-p buffer))
            (kill-buffer buffer))))))
 
+(ert-deftest zulip-feed-sender-face-colors-stable-user-identity ()
+  (let* ((original
+          '((sender_id . 2)
+            (sender_full_name . "Original Name")))
+         (renamed
+          '((sender_id . 2)
+            (sender_full_name . "Renamed User")))
+         (expected
+          (list (appkit-name-color-face "2")
+                'zulip-message-sender-face)))
+    (should (equal expected (zulip-feed--message-sender-face original)))
+    (should
+     (equal (zulip-feed--message-sender-face original)
+            (zulip-feed--message-sender-face renamed)))))
+
 (ert-deftest zulip-narrow-has-stable-key-and-wire-json ()
   (let ((all (zulip-narrow-all))
         (channel (zulip-narrow-channel 7))

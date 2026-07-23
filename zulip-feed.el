@@ -22,6 +22,7 @@
 (require 'appkit-chat-history)
 (require 'appkit-chat-ins)
 (require 'appkit-chat-timeline)
+(require 'appkit-name-color)
 (require 'appkit-ui)
 (require 'appkit-view)
 (require 'zulip-customize)
@@ -609,6 +610,23 @@ Both Lisp hyphen names and API underscore names are accepted."
               (zulip-feed--field message 'sender-id)
               "unknown")))
 
+(defun zulip-feed--message-sender-color-key (message)
+  "Return MESSAGE's stable sender key for shared name coloring."
+  (format "%s"
+          (or (zulip-feed--field message 'sender-id)
+              (zulip-feed--field message 'sender-email)
+              (zulip-feed--message-sender message))))
+
+(defun zulip-feed--message-sender-face (message)
+  "Return the sender heading face for MESSAGE."
+  (if (zulip-feed--message-self-p message)
+      'zulip-message-self-face
+    (if-let* ((color-face
+               (appkit-name-color-face
+                (zulip-feed--message-sender-color-key message))))
+        (list color-face 'zulip-message-sender-face)
+      'zulip-message-sender-face)))
+
 (defun zulip-feed--insert-message-body (message)
   "Insert MESSAGE body, preserving local Markdown as literal text."
   (let ((local-content (zulip-feed--field message 'local-content))
@@ -738,9 +756,7 @@ Both Lisp hyphen names and API underscore names are accepted."
           (zulip-feed--insert-breadcrumb message breadcrumb body-prefix)
           (zulip-feed--insert-message-content message body-prefix))
       (let ((heading-start (point))
-            (sender-face (if (zulip-feed--message-self-p message)
-                             'zulip-message-self-face
-                           'zulip-message-sender-face)))
+            (sender-face (zulip-feed--message-sender-face message)))
         (insert (propertize sender 'face sender-face))
         (when starred
           (insert (propertize "  ★" 'face 'font-lock-constant-face
