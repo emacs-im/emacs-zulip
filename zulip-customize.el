@@ -126,7 +126,9 @@ Zulip; cached gaps and opaque message IDs are never guessed."
 
 (defface zulip-message-sender-face
   '((t :inherit font-lock-keyword-face :weight semi-bold))
-  "Face used for another user's message heading."
+  "Base face used for another user's message heading.
+
+Feed headings combine it with Appkit's identity-keyed name color."
   :group 'zulip)
 
 (defface zulip-message-self-face
