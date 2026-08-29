@@ -168,6 +168,16 @@ may arrive in either order; promotion is idempotent.  A failed row remains in
 the timeline and can be clicked or retried with `R` without changing its local
 identity.
 
+## Evil
+
+When Evil is installed, `zulip-evil-enable-integration` enables native normal-
+and motion-state bindings without raising the ordinary Zulip maps above Evil.
+Native operators and prefixes such as `gg` and `e` therefore keep their Evil
+meaning.  Application commands use deliberate aliases such as `g r` for
+refresh, uppercase message actions, and `i` to focus the composer and enter
+insert state in one command.  Set `zulip-evil-initial-state` to nil to retain
+your own initial-state policy.
+
 ## Global mode line
 
 Enable `M-x zulip-mode-line-mode` to aggregate unread and mention counts across
@@ -176,7 +186,7 @@ mention counts are clickable shortcuts into the account navigator.
 
 ## Current limitations
 
-The Appkit 0.2.18 lifecycle, view ownership, sectioned directory, timeline,
+The Appkit 0.2.19 lifecycle, view ownership, sectioned directory, timeline,
 history, chat buffer, completion, responsive layout, mode-line, and avatar
 infrastructure are integrated.  Sender avatars
 use an account-owned Zulip adapter over Appkit's resource acquisition and disk
