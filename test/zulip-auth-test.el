@@ -1,150 +1,202 @@
-;;; zulip-auth-test.el --- Zuliprc discovery tests -*- lexical-binding: t; -*-
+;;; zulip-auth-test.el --- Auth-source credential tests -*- lexical-binding: t; -*-
 
 ;;; Code:
 
 (require 'ert)
 (require 'cl-lib)
+(require 'seq)
 (require 'zulip-auth)
 (require 'zulip)
 
-(defmacro zulip-auth-test--with-file (contents binding &rest body)
-  "Write CONTENTS to a temporary zuliprc bound as BINDING, then run BODY."
-  (declare (indent 2) (debug (form symbolp body)))
-  `(let ((,binding (make-temp-file "emacs-zuliprc-")))
-     (unwind-protect
-         (progn
-           (with-temp-file ,binding
-             (insert ,contents))
-           ,@body)
-       (delete-file ,binding))))
 
-(ert-deftest zulip-auth-parses-standard-and-named-sections ()
-  (zulip-auth-test--with-file
-      (concat
-       "\ufeff  # leading comment\n"
-       "\n"
-       " [ api ] \n"
-       " email = me@example.com \n"
-       " key = secret-one \n"
-       " site = https://chat.example.com/ \n"
-       "; another comment\n"
-       "[work]\n"
-       "SITE: https://work.example.com\n"
-       "EMAIL: worker@example.com\n"
-       "KEY: secret-two\n")
-      file
-    (let ((profiles (zulip-auth-read-profiles file)))
-      (should (= (length profiles) 2))
-      (pcase-let ((`(,personal ,work) profiles))
-        (should (equal (zulip-auth-profile-name personal) "api"))
-        (should (equal (zulip-auth-profile-server personal)
-                       "https://chat.example.com/"))
-        (should (equal (zulip-auth-profile-email personal) "me@example.com"))
-        (should (equal (zulip-auth-profile-api-key personal) "secret-one"))
-        (should (equal (zulip-auth-profile-name work) "work"))
-        (should (equal (zulip-auth-profile-server work)
-                       "https://work.example.com"))))))
+(ert-deftest zulip-auth-configured-targets-normalize-origin-and-service ()
+  (let ((zulip-accounts
+         '((:name " Work "
+            :server "https://Chat.Example.COM:443/"
+            :email " me@example.com ")
+           (:name "Private"
+            :server "https://chat.example.com:8443"
+            :email "other@example.com"))))
+    (pcase-let ((`(,work ,private) (zulip-auth-configured-targets)))
+      (should (equal (zulip-auth-target-name work) "Work"))
+      (should (equal (zulip-auth-target-server work)
+                     "https://chat.example.com"))
+      (should (equal (zulip-auth-target-email work) "me@example.com"))
+      (should
+       (equal (zulip-auth-source-spec
+               (zulip-auth-target-server work)
+               (zulip-auth-target-email work))
+              '(:host "chat.example.com"
+                :user "me@example.com"
+                :port "zulip")))
+      (should
+       (equal (plist-get
+               (zulip-auth-source-spec
+                (zulip-auth-target-server private)
+                (zulip-auth-target-email private))
+               :port)
+              "zulip-8443")))))
 
-(ert-deftest zulip-auth-skips-incomplete-sections-without-value-leakage ()
-  (zulip-auth-test--with-file
-      (concat
-       "[missing-key]\nemail=a@example.com\nsite=https://a.example\n"
-       "[complete]\nemail=b@example.com\nkey=b-key\nsite=https://b.example\n"
-       "[empty]\nemail=c@example.com\nkey=   \nsite=https://c.example\n")
-      file
-    (let ((profiles (zulip-auth-read-profiles file)))
-      (should (= (length profiles) 1))
-      (should (equal (zulip-auth-profile-name (car profiles)) "complete"))
-      (should (equal (zulip-auth-profile-api-key (car profiles)) "b-key")))))
+(ert-deftest zulip-auth-configured-targets-reject-ambiguous-or-unsafe-input ()
+  (dolist
+      (accounts
+       '(((:name "work" :server "http://chat.example.com"
+          :email "me@example.com"))
+         ((:name "work" :server "https://chat.example.com/path"
+          :email "me@example.com"))
+         ((:name "work" :server "https://chat.example.com?token=value"
+          :email "me@example.com"))
+         ((:name "work" :server "https://user@chat.example.com"
+          :email "me@example.com"))
+         ((:name "work" :name "duplicate"
+          :server "https://chat.example.com" :email "me@example.com"))
+         ((:name "work" :server "https://chat.example.com"
+          :email "me@example.com" :api-key "must-not-live-here"))
+         ((:name "work" :server "https://chat.example.com"
+          :email "me@example.com")
+          (:name "WORK" :server "https://other.example.com"
+          :email "other@example.com"))
+         ((:name "one" :server "https://chat.example.com"
+          :email "me@example.com")
+          (:name "two" :server "https://CHAT.example.com/"
+          :email "ME@example.com"))))
+    (let ((zulip-accounts accounts))
+      (should-error (zulip-auth-configured-targets) :type 'user-error))))
 
-(ert-deftest zulip-auth-missing-or-disabled-file-is-empty ()
-  (let ((zulip-rc-file nil))
-    (should-not (zulip-auth-read-profiles)))
-  (should-not
-   (zulip-auth-read-profiles
-    (expand-file-name "definitely-missing-zuliprc" temporary-file-directory))))
-
-(ert-deftest zulip-auth-selection-never-displays-api-key ()
-  (let* ((first (zulip-auth-profile-create
+(ert-deftest zulip-auth-target-selection-is-secret-free ()
+  (let* ((first (zulip-auth-target--create
                  :name "one" :server "https://one.example"
-                 :email "one@example.com" :api-key "DO-NOT-DISPLAY-ONE"))
-         (second (zulip-auth-profile-create
+                 :email "one@example.com"))
+         (second (zulip-auth-target--create
                   :name "two" :server "https://two.example"
-                  :email "two@example.com" :api-key "DO-NOT-DISPLAY-TWO"))
+                  :email "two@example.com"))
          seen-collection)
     (cl-letf (((symbol-function 'completing-read)
                (lambda (_prompt collection &rest _)
                  (setq seen-collection collection)
                  (caar (last collection)))))
-      (should (eq (zulip-auth-select-profile (list first second)) second)))
-    (let ((display (format "%S" (mapcar #'car seen-collection))))
-      (should-not (string-match-p "DO-NOT-DISPLAY" display))
-      (should (string-match-p "two@example.com" display)))))
+      (should (eq (zulip-auth-select-target (list first second)) second)))
+    (should (string-match-p "two@example.com"
+                            (format "%S" (mapcar #'car seen-collection))))))
 
-(ert-deftest zulip-auth-single-profile-selection-does-not-prompt ()
-  (let ((profile (zulip-auth-profile-create
-                  :name "api" :server "https://chat.example"
-                  :email "me@example.com" :api-key "secret")))
+(ert-deftest zulip-auth-single-target-selection-does-not-prompt ()
+  (let ((target
+         (zulip-auth-target--create
+          :name "work" :server "https://chat.example.com"
+          :email "me@example.com")))
     (cl-letf (((symbol-function 'completing-read)
                (lambda (&rest _) (ert-fail "Unexpected account prompt"))))
-      (should (eq (zulip-auth-select-profile (list profile)) profile)))))
+      (should (eq (zulip-auth-select-target (list target)) target)))))
 
-(ert-deftest zulip-connect-from-zuliprc-passes-selected-credentials ()
-  (zulip-auth-test--with-file
-      "[api]\nsite=https://chat.example\nemail=me@example.com\nkey=private-key\n"
-      file
-    (let (arguments)
-      (cl-letf (((symbol-function 'zulip-connect)
-                 (lambda (&rest values)
-                   (setq arguments values)
-                   'connected)))
-        (should (eq (zulip-connect-from-zuliprc file) 'connected))
-        (should (equal arguments
-                       '("https://chat.example" "me@example.com" "private-key")))))))
+(ert-deftest zulip-auth-api-key-uses-exact-locator-and-copies-secret ()
+  (let ((stored-secret (copy-sequence "stored-secret"))
+        seen-arguments)
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest arguments)
+                 (setq seen-arguments arguments)
+                 (list (list :secret (lambda () stored-secret))))))
+      (let ((api-key
+             (zulip-auth-api-key
+              "https://chat.example.com" "me@example.com")))
+        (should (equal api-key "stored-secret"))
+        (should-not (eq api-key stored-secret))
+        (should
+         (equal seen-arguments
+                '(:host "chat.example.com"
+                  :user "me@example.com"
+                  :port "zulip"
+                  :require (:secret :port)
+                  :max 1)))
+        (clear-string api-key)
+        (should (equal stored-secret "stored-secret"))))))
 
-(ert-deftest zulip-without-explicit-credentials-prefers-zuliprc ()
-  (zulip-auth-test--with-file
-      "[api]\nsite=https://chat.example\nemail=me@example.com\nkey=private-key\n"
-      file
-    (let ((zulip-rc-file file)
-          connected
-          opened)
-      (cl-letf (((symbol-function 'zulip--connect-or-reuse)
-                 (lambda (&rest values)
-                   (setq connected values)
-                   'account))
-                ((symbol-function 'zulip-root-open)
-                 (lambda (account)
-                   (setq opened account)
-                   'root)))
-        (should (eq (zulip) 'root))
-        (should (eq opened 'account))
-        (should (equal connected
-                       '("https://chat.example" "me@example.com" "private-key")))))))
+(ert-deftest zulip-auth-api-key-rejects-missing-or-invalid-secret ()
+  (dolist (source '(nil ((:secret "bad\nsecret"))))
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest _) source)))
+      (should-error
+       (zulip-auth-api-key "https://chat.example.com" "me@example.com")
+       :type 'user-error))))
 
-(ert-deftest zulip-explicit-credentials-bypass-zuliprc ()
+(ert-deftest zulip-connect-or-reuse-retires-resolved-key-and-skips-live-account ()
+  (let (passed-key passed-copy)
+    (cl-letf (((symbol-function 'zulip-runtime-account)
+               (lambda (&rest _) nil))
+              ((symbol-function 'zulip-auth-api-key)
+               (lambda (&rest _) (copy-sequence "private-key")))
+              ((symbol-function 'zulip-connect)
+               (lambda (_server _email api-key)
+                 (setq passed-key api-key
+                       passed-copy (copy-sequence api-key))
+                 'connected)))
+      (should
+       (eq (zulip--connect-or-reuse
+            "https://chat.example.com" "me@example.com" nil)
+           'connected)))
+    (should (equal passed-copy "private-key"))
+    (should (seq-every-p #'zerop (string-to-list passed-key))))
+  (cl-letf (((symbol-function 'zulip-runtime-account)
+             (lambda (&rest _) 'live-account))
+            ((symbol-function 'zulip-auth-api-key)
+             (lambda (&rest _)
+               (ert-fail "Live account must not query auth-source")))
+            ((symbol-function 'zulip-connect)
+             (lambda (&rest _)
+               (ert-fail "Live account must not reconnect"))))
+    (should
+     (eq (zulip--connect-or-reuse
+          "https://chat.example.com" "me@example.com" nil)
+         'live-account))))
+
+
+(ert-deftest zulip-default-entry-selects-configured-auth-source-target ()
+  (let ((zulip-accounts
+         '((:name "work" :server "https://chat.example.com"
+            :email "me@example.com")))
+        connected
+        opened)
+    (cl-letf (((symbol-function 'zulip--connect-or-reuse)
+               (lambda (&rest values)
+                 (setq connected values)
+                 'account))
+              ((symbol-function 'zulip-root-open)
+               (lambda (account)
+                 (setq opened account)
+                 'root)))
+      (should (eq (zulip) 'root))
+      (should (eq opened 'account))
+      (should
+       (equal connected
+              '("https://chat.example.com" "me@example.com" nil))))))
+
+(ert-deftest zulip-connect-is-programmatic-only ()
+  (should (functionp #'zulip-connect))
+  (should-not (commandp #'zulip-connect)))
+
+(ert-deftest zulip-explicit-credentials-bypass-auth-source ()
   (let (connected)
     (cl-letf (((symbol-function 'zulip--connect-or-reuse)
                (lambda (&rest values)
                  (setq connected values)
                  'account))
-              ((symbol-function 'zulip-auth-read-profiles)
+              ((symbol-function 'zulip-auth-api-key)
                (lambda (&rest _)
-                 (ert-fail "Explicit credentials must bypass zuliprc")))
+                 (ert-fail "Explicit API key must bypass auth-source")))
               ((symbol-function 'zulip-root-open) #'identity))
       (should (eq (zulip "https://manual.example" "me@example.com" "key")
                   'account))
-      (should (equal connected
-                     '("https://manual.example" "me@example.com" "key"))))))
+      (should
+       (equal connected
+              '("https://manual.example" "me@example.com" "key"))))))
 
-(ert-deftest zulip-combined-feed-without-credentials-prefers-zuliprc ()
+(ert-deftest zulip-combined-feed-without-arguments-uses-default-target ()
   (let (opened-account
         opened-narrow)
     (cl-letf (((symbol-function 'zulip--connect-default)
                (lambda () 'default-account))
               ((symbol-function 'zulip--connect-or-reuse)
                (lambda (&rest _)
-                 (ert-fail "No-argument combined feed must use zuliprc")))
+                 (ert-fail "No-argument combined feed must use default target")))
               ((symbol-function 'zulip-feed-open)
                (lambda (account narrow)
                  (setq opened-account account

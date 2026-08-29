@@ -11,26 +11,43 @@
   :group 'applications
   :prefix "zulip-")
 
+(defcustom zulip-accounts nil
+  "Configured non-secret Zulip account targets.
+
+Each entry is a plist with required `:name', `:server', and `:email' keys.
+NAME is a local display label.  SERVER must be an HTTPS origin without
+credentials, path, query, or fragment.  EMAIL is the Zulip login used with
+SERVER.  API keys are resolved from `auth-source' and must not appear here.
+
+For example:
+
+  ((:name \"work\"
+    :server \"https://chat.example.com\"
+    :email \"me@example.com\"))"
+  :type
+  '(repeat
+    (plist
+     :options
+     ((:name (string :tag "Local name"))
+      (:server (string :tag "HTTPS server origin"))
+      (:email (string :tag "Zulip email")))
+     :key-type symbol
+     :value-type sexp))
+  :group 'zulip)
+
 (defcustom zulip-default-server nil
-  "Default Zulip realm URL, for example `https://chat.example.com'."
+  "Default Zulip realm URL when no entry exists in `zulip-accounts'."
   :type '(choice (const :tag "Prompt every time" nil) string)
   :group 'zulip)
 
 (defcustom zulip-default-email nil
-  "Default Zulip login email.
+  "Default Zulip login email when no entry exists in `zulip-accounts'.
 
-The API key is intentionally not stored in a customization variable."
+The API key is resolved from `auth-source', never from a customization
+variable."
   :type '(choice (const :tag "Prompt every time" nil) string)
   :group 'zulip)
 
-(defcustom zulip-rc-file "~/.zuliprc"
-  "File from which `zulip' discovers account credentials.
-
-The file uses INI sections.  A standard `[api]' section and additional named
-sections are both accepted.  Set this option to nil to disable credential-file
-discovery and retain the manual server, email, and API-key prompts."
-  :type '(choice (const :tag "Disable zuliprc discovery" nil) file)
-  :group 'zulip)
 
 (defcustom zulip-event-long-poll-timeout 90
   "Seconds an event queue long-poll may wait before timing out."

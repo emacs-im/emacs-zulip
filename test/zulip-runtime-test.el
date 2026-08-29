@@ -3,6 +3,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'seq)
 (require 'zulip-runtime)
 (require 'zulip)
 
@@ -33,6 +34,49 @@
       (should (equal (zulip-account-api-key second) "two"))
       (should (eq (zulip-account-state second) 'old))
       (should (eq (appkit-app-state (zulip-account-app second)) 'old)))))
+
+(ert-deftest zulip-runtime-owns-replaces-and-erases-api-key-copies ()
+  (zulip-runtime-test--isolated
+    (let* ((first-source (copy-sequence "first-secret"))
+           (account
+            (zulip-runtime-create-account
+             :server "https://chat.example.com"
+             :email "me@example.com"
+             :api-key first-source))
+           (first-owned (zulip-account-api-key account))
+           (second-source (copy-sequence "second-secret")))
+      (should (equal first-owned first-source))
+      (should-not (eq first-owned first-source))
+      (zulip-runtime-create-account
+       :server "https://chat.example.com"
+       :email "me@example.com"
+       :api-key second-source)
+      (let ((second-owned (zulip-account-api-key account)))
+        (should (seq-every-p #'zerop (string-to-list first-owned)))
+        (should (equal first-source "first-secret"))
+        (should (equal second-source "second-secret"))
+        (should (equal second-owned second-source))
+        (should-not (eq second-owned second-source))
+        (zulip-runtime-stop-account account)
+        (should (seq-every-p #'zerop (string-to-list second-owned)))
+        (should-not (zulip-account-api-key account))))))
+
+(ert-deftest zulip-runtime-startup-failure-erases-owned-api-key ()
+  (zulip-runtime-test--isolated
+    (let (owned-key)
+      (cl-letf (((symbol-function 'appkit-start-app)
+                 (lambda (_kind &rest options)
+                   (setq owned-key
+                         (zulip-account-api-key
+                          (plist-get options :transport)))
+                   (error "startup failed"))))
+        (should-error
+         (zulip-runtime-create-account
+          :server "https://chat.example.com"
+          :email "me@example.com"
+          :api-key "startup-secret")))
+      (should (seq-every-p #'zerop (string-to-list owned-key)))
+      (should-not (zulip-runtime-accounts)))))
 
 (ert-deftest zulip-runtime-publish-state-keeps-account-and-app-canonical ()
   (zulip-runtime-test--isolated

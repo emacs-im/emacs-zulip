@@ -6,8 +6,8 @@ chat-buffer experience inspired by telega.el, disco.el, and emacs-qq.
 The package currently provides a complete text-message vertical slice:
 
 - one Appkit application per normalized `(server, email)` account;
-- `.zuliprc` discovery for one or several accounts, without showing API keys
-  in account-selection UI;
+- non-secret configured account targets with API keys resolved through
+  `auth-source`;
 - `/register`, consecutive long-poll event processing, retry, and expired-queue
   re-registration;
 - normalized users, subscriptions, unread state, recent direct conversations,
@@ -37,37 +37,42 @@ it never round-trips an ID through an Emacs number.
 
 ## Account configuration
 
-`M-x zulip` first reads `zulip-rc-file`, which defaults to `~/.zuliprc`.  The
-usual Zulip CLI format works:
+Configure only account metadata in Emacs:
 
-```ini
-[api]
-site=https://chat.example.com
-email=person@example.com
-key=replace-with-your-api-key
+```elisp
+(setq zulip-accounts
+      '((:name "work"
+         :server "https://chat.example.com"
+         :email "person@example.com")
+        (:name "community"
+         :server "https://chat.example.org:8443"
+         :email "person@example.org")))
 ```
 
-Additional named sections provide multiple accounts:
+Each server must be an HTTPS origin without credentials, path, query, or
+fragment.  Names and normalized `(server, email)` identities must be unique.
+With one target, `M-x zulip` uses it directly; with several, completion shows
+only the local name, email, and server.  With no configured target, Zulip
+prompts for a server and email.
 
-```ini
-[work]
-site=https://work.example.com
-email=person@work.example.com
-key=replace-with-your-work-api-key
+API keys come from `auth-source`.  For the accounts above, an encrypted
+`~/.authinfo.gpg` can contain:
 
-[community]
-site=https://chat.example.org
-email=person@example.org
-key=replace-with-your-community-api-key
+```text
+machine chat.example.com login person@example.com port zulip password API_KEY
+machine chat.example.org login person@example.org port zulip-8443 password API_KEY
 ```
 
-With one complete section, `zulip` uses it directly.  With several, it prompts
-with section name, email, and server only.  Incomplete sections are ignored.
-Set `zulip-rc-file` to nil to use the manual server/email/API-key prompts.  An
-API key is kept only in the live account object; it is not a Customize
-variable and is never included in completion labels or status text.
+Default HTTPS uses the service name `zulip`; a non-default origin port uses
+`zulip-PORT`.  The same exact host, email, and service tuple is used for
+lookup, so unrelated web credentials cannot satisfy a Zulip account.
+Standard auth-source backends such as encrypted authinfo and password-store
+remain available through `auth-sources`.
 
-`M-x zulip-connect-from-zuliprc` can connect an account from another file.
+The selected API key is copied into the live account only after lookup.  The
+account erases its owned copy when credentials are replaced or the Appkit
+session stops.  API keys never enter Customize data, completion labels,
+buffer names, or status messages.
 
 ## Navigator
 
