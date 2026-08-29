@@ -18,6 +18,7 @@
 (require 'subr-x)
 (require 'url-util)
 (require 'appkit-core)
+(require 'appkit-compose)
 (require 'appkit-invalidation)
 (require 'appkit-chat-avatar)
 (require 'appkit-chatbuf)
@@ -28,6 +29,7 @@
 (require 'appkit-ui)
 (require 'appkit-markup)
 (require 'appkit-markup-ui)
+(require 'appkit-markup-compose)
 (require 'appkit-view)
 (require 'zulip-customize)
 (require 'zulip-completion)
@@ -144,24 +146,29 @@
 (cl-defun zulip-feed--set-edit-state
     (message-id request-p &optional message saved-input
                 &key
+                (saved-codec nil saved-codec-supplied-p)
                 (generation nil generation-supplied-p)
                 (operation-owner nil operation-owner-supplied-p))
   "Set Appkit edit aux state for MESSAGE-ID and REQUEST-P.
 
 MESSAGE supplies the context row when starting an edit; later state changes
-preserve the existing context object.  SAVED-INPUT is the rich draft to
-restore when the edit finishes or is cancelled.  GENERATION owns the logical
-edit session, while OPERATION-OWNER identifies its exact GET or PATCH."
+preserve the existing context object.  SAVED-INPUT and SAVED-CODEC restore the
+preceding rich draft interpretation when editing finishes or is cancelled.
+GENERATION owns the logical edit session, while OPERATION-OWNER identifies its
+exact GET or PATCH."
   (let* ((existing (zulip-feed--edit-state))
          (state (copy-sequence
                  (or existing
                      (list :aux-type 'edit :saved-input saved-input
+                           :saved-codec saved-codec
                            :generation zulip-feed--edit-generation)))))
     (setq state (plist-put state :aux-type 'edit)
           state (plist-put state :message-id message-id)
           state (plist-put state :request-p (and request-p t)))
     (when message
       (setq state (plist-put state :aux-msg message)))
+    (when saved-codec-supplied-p
+      (setq state (plist-put state :saved-codec saved-codec)))
     (when generation-supplied-p
       (setq state (plist-put state :generation generation)))
     (when operation-owner-supplied-p
@@ -178,8 +185,14 @@ edit session, while OPERATION-OWNER identifies its exact GET or PATCH."
 
 The next Appkit synchronization transaction materializes that canonical
 composer state.  This function never edits generated buffer content or point."
-  (let ((saved-input (plist-get (zulip-feed--edit-state) :saved-input)))
+  (let* ((state (zulip-feed--edit-state))
+         (saved-input (plist-get state :saved-input))
+         (saved-codec (plist-get state :saved-codec)))
     (appkit-chatbuf-aux-reset)
+    (when (and saved-codec
+               (not (eq saved-codec
+                        appkit-markup-compose-active-codec)))
+      (appkit-markup-compose-set-active-codec saved-codec))
     (appkit-chatbuf-input-state-set
      (or saved-input "") :reset-history-p t)))
 
@@ -1008,7 +1021,7 @@ timeline flush with the top of the buffer like telega chat buffers."
                    "connecting"))
          (unread (and (zulip-state-p state)
                       (zulip-state-unread-count state))))
-    (format " Zulip  [%s]  %s  ·  %s%s"
+    (format " Zulip  [%s]  %s  ·  %s%s%s"
             status
             (if (zulip-account-p account)
                 (zulip-account-server account)
@@ -1018,6 +1031,11 @@ timeline flush with the top of the buffer like telega chat buffers."
               "Messages")
             (if (and (integerp unread) (> unread 0))
                 (format "  (%d unread)" unread)
+              "")
+            (if (and (bound-and-true-p appkit-markup-compose-active-codec)
+                     (zulip-feed--composer-visible-p))
+                (format "  ·  compose: %s"
+                        (appkit-markup-compose-codec-label))
               ""))))
 
 (defun zulip-feed--footer-text ()
@@ -1872,66 +1890,105 @@ human-readable composer projection used for optimistic display."
       (zulip-feed--mark-send-failed
        account local-id (zulip-feed--result-message result)))))
 
-(defun zulip-feed-send-message ()
-  "Send the composer contents, or submit its staged message edit."
-  (interactive)
+(defun zulip-feed--compose-snapshot (&optional prefix)
+  "Return one immutable semantic composer snapshot selected by PREFIX."
+  (appkit-chatbuf-input-state-sync)
+  (let* ((input (appkit-chatbuf-input-state))
+         (capture (appkit-markup-compose-capture prefix))
+         (output
+          (appkit-markup-compose-output
+           capture 'markdown
+           :object-printer #'zulip-completion-markup-object-printer))
+         (losses (appkit-markup-compose-output-losses output)))
+    (when losses
+      (user-error "Zulip markup conversion would lose %s"
+                  (appkit-markup-loss-kind (car losses))))
+    (list :input input
+          :capture capture
+          :content (appkit-markup-compose-output-source output)
+          :local-content
+          (appkit-markup-plain-text
+           (appkit-markup-compose-output-document output)))))
+
+(defun zulip-feed-preview-message (&optional prefix)
+  "Preview the current composer using PREFIX-selected markup codec."
+  (interactive "P")
+  (unless (zulip-feed--composer-visible-p)
+    (user-error "This feed has no writable composer"))
+  (appkit-chatbuf-input-state-sync)
+  (let* ((capture (appkit-markup-compose-capture prefix))
+         (buffer (get-buffer-create "*Zulip Compose Preview*")))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (appkit-markup-compose-preview capture)
+        (goto-char (point-min))
+        (setq-local buffer-read-only t)
+        (setq-local truncate-lines nil)))
+    (display-buffer buffer)
+    buffer))
+
+(defun zulip-feed-send-message (&optional prefix)
+  "Send composer contents using PREFIX-selected markup, or submit an edit."
+  (interactive "P")
   (zulip-feed--assert-edit-composer-mutable)
   (if (zulip-feed--edit-message-id)
-      (zulip-feed-submit-edit)
+      (zulip-feed-submit-edit prefix)
     (let* ((account zulip-feed--account)
            (target (zulip-narrow-send-target zulip-feed--narrow))
-           (input (or (appkit-chatbuf-input-string) ""))
-           (content (zulip-completion-serialize-input input))
-           (local-content (substring-no-properties input))
            (queue-id (zulip-account-queue-id account)))
       (unless target
         (user-error "This Zulip feed does not identify a send destination"))
       (when (appkit-chat-history-window-partial-p)
         (user-error "Load newer Zulip messages before sending"))
-      (when (string-empty-p (string-trim content))
-        (user-error "Message is empty"))
       (unless (and (stringp queue-id) (not (string-empty-p queue-id)))
         (user-error "Zulip event queue is not ready"))
       (unless (and (fboundp 'zulip-api-send-message)
                    (fboundp 'zulip-state-upsert-message))
         (error "Zulip send/state interfaces are unavailable"))
-      (let* ((local-id (zulip-feed--new-local-id))
-             (message (zulip-feed--pending-message
-                       local-id queue-id content target local-content))
-             (state (zulip-feed--account-state))
-             (next-state
-              (zulip-state-upsert-message
-               state message (list (zulip-narrow-key zulip-feed--narrow))))
-             (view (appkit-current-view)))
-        (puthash local-id message zulip-feed--pending)
-        (cond
-         ((appkit-chat-history-window-empty-p)
-          (appkit-chat-history-window-seed-live local-id))
-         ((not (appkit-chat-history-window-known-p))
-          (appkit-chat-history-window-set local-id nil))
-         ((null (appkit-chat-history-window-first-key))
-          (appkit-chat-history-window-set
-           local-id (appkit-chat-history-window-last-key))))
-        (zulip-feed--on-app-event
-         account
-         (list (cons 'type "local_message")
-               (cons 'message message))
-         state next-state)
-        (when (appkit-view-live-p view)
-          (appkit-sync-invalidations view))
-        (appkit-chatbuf-input-history-push content)
-        (appkit-chatbuf-input-set-text "")
-        (zulip-api-send-message
-         account
-         (plist-get target :type)
-         (plist-get target :to)
-         (plist-get target :topic)
-         content
-         (lambda (result)
-           (zulip-feed--send-finished account local-id result))
-         :local-id local-id
-         :queue-id queue-id)
-        local-id))))
+      (let* ((snapshot (zulip-feed--compose-snapshot prefix))
+             (input (plist-get snapshot :input))
+             (content (plist-get snapshot :content))
+             (local-content (plist-get snapshot :local-content)))
+        (when (string-empty-p (string-trim content))
+          (user-error "Message is empty"))
+        (let* ((local-id (zulip-feed--new-local-id))
+               (message (zulip-feed--pending-message
+                         local-id queue-id content target local-content))
+               (state (zulip-feed--account-state))
+               (next-state
+                (zulip-state-upsert-message
+                 state message (list (zulip-narrow-key zulip-feed--narrow))))
+               (view (appkit-current-view)))
+          (puthash local-id message zulip-feed--pending)
+          (cond
+           ((appkit-chat-history-window-empty-p)
+            (appkit-chat-history-window-seed-live local-id))
+           ((not (appkit-chat-history-window-known-p))
+            (appkit-chat-history-window-set local-id nil))
+           ((null (appkit-chat-history-window-first-key))
+            (appkit-chat-history-window-set
+             local-id (appkit-chat-history-window-last-key))))
+          (zulip-feed--on-app-event
+           account
+           (list (cons 'type "local_message")
+                 (cons 'message message))
+           state next-state)
+          (when (appkit-view-live-p view)
+            (appkit-sync-invalidations view))
+          (appkit-chatbuf-input-history-push input)
+          (appkit-chatbuf-input-set-text "")
+          (zulip-api-send-message
+           account
+           (plist-get target :type)
+           (plist-get target :to)
+           (plist-get target :topic)
+           content
+           (lambda (result)
+             (zulip-feed--send-finished account local-id result))
+           :local-id local-id
+           :queue-id queue-id)
+          local-id)))))
 
 
 (defun zulip-feed-message-id-at-point (&optional position)
@@ -2276,6 +2333,8 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
            message-id nil nil nil
            :generation generation :operation-owner nil)
           (setq zulip-feed--last-error nil)
+          (unless (eq appkit-markup-compose-active-codec 'markdown)
+            (appkit-markup-compose-set-active-codec 'markdown))
           (appkit-chatbuf-input-state-set raw :reset-history-p t)
           (zulip-feed--request-edit-sync
            view generation
@@ -2323,6 +2382,7 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
                  view generation id 'get)))
     (zulip-feed--set-edit-state
      id t message (copy-sequence (or (appkit-chatbuf-input-state) ""))
+     :saved-codec appkit-markup-compose-active-codec
      :generation generation :operation-owner owner)
     ;; A just-finished or cancelled predecessor may have updated canonical
     ;; draft state without materializing it yet.  The new generation owns that
@@ -2352,9 +2412,9 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
            (zulip-feed-edit-draft))
          (message "Zulip: edit cancelled"))))))
 
-(defun zulip-feed-submit-edit ()
-  "Submit the staged message edit from the Appkit composer."
-  (interactive)
+(defun zulip-feed-submit-edit (&optional prefix)
+  "Submit the staged edit using PREFIX-selected markup codec."
+  (interactive "P")
   (unless (zulip-feed--edit-message-id)
     (user-error "No Zulip message edit is active"))
   (when (zulip-feed--edit-request-p)
@@ -2363,8 +2423,8 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
     (user-error "The Zulip edit composer is still being materialized"))
   (let* ((state (zulip-feed--edit-state))
          (message-id (zulip-feed--edit-message-id))
-         (content (zulip-completion-serialize-input
-                   (or (appkit-chatbuf-input-string) "")))
+         (snapshot (zulip-feed--compose-snapshot prefix))
+         (content (plist-get snapshot :content))
          (view (appkit-current-view))
          (generation (plist-get state :generation)))
     (unless (eq generation zulip-feed--edit-generation)
@@ -2636,6 +2696,41 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
   :lighter nil
   :keymap zulip-feed-message-map)
 
+(defun zulip-feed-format-input (operation)
+  "Apply codec-aware formatting OPERATION to composer point or region."
+  (interactive
+   (list
+    (intern
+     (completing-read
+      "Formatting: "
+      '("bold" "italic" "underline" "strike" "code" "link" "quote"
+        "unordered-list" "ordered-list" "heading" "preformatted")
+      nil t))))
+  (unless (zulip-feed--composer-visible-p)
+    (user-error "This feed has no writable composer"))
+  (pcase operation
+    ('bold (appkit-markup-compose-bold))
+    ('italic (appkit-markup-compose-italic))
+    ('underline (appkit-markup-compose-underline))
+    ('strike (appkit-markup-compose-strike))
+    ('code (appkit-markup-compose-code))
+    ('link (call-interactively #'appkit-markup-compose-link))
+    ('quote (appkit-markup-compose-quote))
+    ('unordered-list (appkit-markup-compose-unordered-list))
+    ('ordered-list (appkit-markup-compose-ordered-list))
+    ('heading (call-interactively #'appkit-markup-compose-heading))
+    ('preformatted
+     (call-interactively #'appkit-markup-compose-preformatted))
+    (_ (user-error "Unsupported formatting operation"))))
+
+(defun zulip-feed-select-compose-codec ()
+  "Select the visible active source codec for this composer."
+  (interactive)
+  (call-interactively #'appkit-markup-compose-set-active-codec)
+  (force-mode-line-update)
+  (message "Zulip compose codec: %s"
+           (appkit-markup-compose-codec-label)))
+
 (defvar-keymap zulip-feed-mode-map
   :doc "Keymap for `zulip-feed-mode'."
   :parent appkit-chatbuf-mode-map
@@ -2647,6 +2742,9 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
   "M-n" #'zulip-feed-draft-next
   "C-c '" #'zulip-feed-edit-draft
   "C-c C-k" #'zulip-feed-cancel-edit
+  "C-c C-e" #'zulip-feed-format-input
+  "C-c C-v" #'zulip-feed-preview-message
+  "C-c C-m" #'zulip-feed-select-compose-codec
   "C-c C-a" #'zulip-message-transient
   "C-c C-t" #'zulip-feed-open-topic
   "C-c RET" #'zulip-feed-send-message
@@ -2677,6 +2775,8 @@ path while leaving account-owned optimistic sends in their shared table."
               (list 'zulip-feed-edit-generation))
   (setq-local zulip-feed--edit-operation-owner nil)
   (setq-local zulip-feed--edit-sync-request nil)
+  (when (bound-and-true-p appkit-compose-session-mode)
+    (appkit-compose-reset))
   (setq-local buffer-read-only nil)
   (setq-local zulip-feed-timeline-mode nil))
 
@@ -2689,6 +2789,13 @@ path while leaving account-owned optimistic sends in their shared table."
   (setq-local buffer-read-only nil)
   (setq-local truncate-lines nil)
   (setq-local header-line-format '(:eval (zulip-feed--header-line)))
+  (appkit-compose-setup
+   :snapshot-function #'appkit-chatbuf-input-state
+   :source-bounds-function #'appkit-chatbuf-input-region-bounds)
+  (appkit-markup-compose-setup
+   :codecs zulip-compose-codecs
+   :active-codec (car zulip-compose-codecs)
+   :object-printer #'zulip-completion-markup-object-printer)
   (appkit-chatbuf-use-timeline-mode #'zulip-feed-timeline-mode)
   (add-hook 'post-command-hook #'zulip-feed--post-command t t)
   (add-hook 'window-scroll-functions #'zulip-feed--window-scroll nil t))
