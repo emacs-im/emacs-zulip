@@ -1,7 +1,7 @@
 ;;; zulip.el --- Appkit-based Zulip client -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (appkit "0.2.18") (plz "0.8") (transient "0.7"))
+;; Package-Requires: ((emacs "29.1") (appkit "0.2.19") (plz "0.8") (transient "0.7"))
 ;; Keywords: comm
 ;; URL: https://github.com/0WD0/emacs-zulip
 
@@ -25,6 +25,7 @@
 (require 'zulip-feed)
 (require 'zulip-root)
 (require 'zulip-modes)
+(require 'zulip-evil)
 
 (defconst zulip-version "0.1.0"
   "Current emacs-zulip package version.")

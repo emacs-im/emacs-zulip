@@ -17,6 +17,9 @@
 (depends-on "transient" "0.7")
 (depends-on "appkit" :file "../appkit.el")
 
+(development
+ (depends-on "evil"))
+
 (script "refresh-appkit" "eask -f install-file ../appkit.el")
 (script "test" "eask test ert test/*.el")
 (script "test-local"
