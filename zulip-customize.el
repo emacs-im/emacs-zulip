@@ -163,6 +163,31 @@ Feed headings combine it with Appkit's identity-keyed name color."
   "Face used for message timestamps."
   :group 'zulip)
 
+(defface zulip-message-mention-face
+  '((t :inherit font-lock-warning-face :weight semi-bold))
+  "Face used for interactive user and group mentions."
+  :group 'zulip)
+
+(defface zulip-message-silent-mention-face
+  '((t :inherit shadow :weight semi-bold))
+  "Face used for silent Zulip mentions."
+  :group 'zulip)
+
+(defface zulip-message-navigation-face
+  '((t :inherit link))
+  "Face used for channel, topic, and message navigation objects."
+  :group 'zulip)
+
+(defface zulip-message-spoiler-face
+  '((t :inherit shadow :weight semi-bold))
+  "Face used for spoiler headings."
+  :group 'zulip)
+
+(defface zulip-message-media-face
+  '((t :inherit shadow))
+  "Face used for safe media placeholders."
+  :group 'zulip)
+
 (defface zulip-message-unread-divider-face
   '((t :inherit font-lock-warning-face :weight bold))
   "Face used for the first-unread divider."

@@ -25,7 +25,7 @@
 (require 'zulip-feed)
 (require 'zulip-http)
 (require 'zulip-narrow)
-(require 'zulip-render)
+(require 'zulip-markup)
 (require 'zulip-runtime)
 (require 'zulip-state)
 
@@ -210,7 +210,14 @@ never pass through this helper and remain opaque strings everywhere."
                                 (zulip-root--field message 'raw-content)
                                 (zulip-root--field message 'content)
                                 "")))
-           (content (zulip-render-plain-text content))
+           (content
+            (zulip-markup-plain-text
+             content
+             (and (zulip-account-p zulip-root--account)
+                  (zulip-account-server zulip-root--account))))
+           ;; One-line summaries keep quote content but omit display geometry.
+           (content
+            (replace-regexp-in-string "^>[ \t]*" "" content))
            (content (string-trim
                      (replace-regexp-in-string "[\t\n\r ]+" " " content))))
       (cond

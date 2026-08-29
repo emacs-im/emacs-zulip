@@ -12,9 +12,11 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'browse-url)
 (require 'button)
 (require 'seq)
 (require 'subr-x)
+(require 'url-util)
 (require 'appkit-core)
 (require 'appkit-invalidation)
 (require 'appkit-chat-avatar)
@@ -24,13 +26,15 @@
 (require 'appkit-chat-timeline)
 (require 'appkit-name-color)
 (require 'appkit-ui)
+(require 'appkit-markup)
+(require 'appkit-markup-ui)
 (require 'appkit-view)
 (require 'zulip-customize)
 (require 'zulip-completion)
 (require 'zulip-runtime)
 (require 'zulip-media)
 (require 'zulip-narrow)
-(require 'zulip-render)
+(require 'zulip-markup)
 (require 'zulip-state)
 
 (declare-function zulip-state-object-get "zulip-state" (object key))
@@ -610,8 +614,187 @@ Both Lisp hyphen names and API underscore names are accepted."
         (list color-face 'zulip-message-sender-face)
       'zulip-message-sender-face)))
 
+(defun zulip-feed--markup-fallback-text (node)
+  "Return semantic fallback text stored by provider object NODE."
+  (cond
+   ((appkit-markup-object-p node)
+    (appkit-markup-plain-text
+     (appkit-markup-document
+      (list
+       (appkit-markup-paragraph
+        (appkit-markup-object-fallback node))))))
+   ((appkit-markup-object-block-p node)
+    (appkit-markup-plain-text
+     (appkit-markup-document
+      (appkit-markup-object-block-fallback node))))
+   (t "")))
+
+(defun zulip-feed--markup-value (node)
+  "Return NODE's validated Zulip provider value."
+  (let ((value
+         (cond
+          ((appkit-markup-object-p node)
+           (appkit-markup-object-value node))
+          ((appkit-markup-object-block-p node)
+           (appkit-markup-object-block-value node)))))
+    (and (zulip-markup-provider-object-p value) value)))
+
+(defun zulip-feed--decode-narrow-segment (segment)
+  "Decode one Zulip hash-narrow URL SEGMENT."
+  (url-unhex-string
+   (replace-regexp-in-string
+    "\\.\\([[:xdigit:]][[:xdigit:]]\\)" "%\\1" (or segment ""))))
+
+(defun zulip-feed--markup-navigation (data)
+  "Return native navigation operands decoded from provider DATA."
+  (when-let* ((url (plist-get data :url))
+              ((string-match "#narrow/\\([^?#]*\\)" url)))
+    (let* ((segments (split-string (match-string 1 url) "/" t))
+           (channel-segment (cadr (member "channel" segments)))
+           (topic-segment (cadr (member "topic" segments)))
+           (near-segment
+            (or (cadr (member "near" segments))
+                (cadr (member "with" segments))))
+           (configured-id (plist-get data :channel-id))
+           (channel-id
+            (cond
+             ((and (stringp configured-id)
+                   (string-match-p "\\`[1-9][0-9]*\\'" configured-id))
+              (string-to-number configured-id))
+             ((and channel-segment
+                   (string-match "\\`\\([1-9][0-9]*\\)" channel-segment))
+              (string-to-number (match-string 1 channel-segment))))))
+      (list :channel-id channel-id
+            :topic (and topic-segment
+                        (zulip-feed--decode-narrow-segment topic-segment))
+            :message-id (and near-segment
+                             (string-match-p "\\`[0-9]+\\'" near-segment)
+                             near-segment)
+            :url url))))
+
+(defun zulip-feed--markup-navigation-action (kind data)
+  "Return native action for provider navigation KIND and DATA."
+  (let* ((navigation (zulip-feed--markup-navigation data))
+         (channel-id (plist-get navigation :channel-id))
+         (topic (plist-get navigation :topic))
+         (message-id (plist-get navigation :message-id))
+         (url (or (plist-get navigation :url) (plist-get data :url)))
+         (account zulip-feed--account))
+    (cond
+     ((and (eq kind 'channel-link) channel-id)
+      (lambda ()
+        (zulip-feed-open account (zulip-narrow-channel channel-id))))
+     ((and (memq kind '(topic-link message-link)) channel-id topic message-id
+           (eq kind 'message-link))
+      (lambda ()
+        (zulip-feed-open-message
+         account (zulip-narrow-topic channel-id topic) message-id)))
+     ((and (memq kind '(topic-link message-link)) channel-id topic)
+      (lambda ()
+        (zulip-feed-open account (zulip-narrow-topic channel-id topic))))
+     ((stringp url) (lambda () (browse-url url))))))
+
+(defun zulip-feed--markup-link-action (url)
+  "Return a browser action for already validated semantic URL."
+  (and (stringp url) (lambda () (browse-url url))))
+
+(defun zulip-feed--insert-markup-fallback (node &optional face action)
+  "Insert NODE's visible fallback with optional FACE and ACTION."
+  (let ((start (point)))
+    (insert (zulip-feed--markup-fallback-text node))
+    (when face
+      (add-face-text-property start (point) face 'append))
+    (when action
+      (appkit-ui-add-action start (point) action :face face))
+    (cons start (point))))
+
+(defun zulip-feed--insert-markup-document (document)
+  "Insert semantic DOCUMENT with Zulip's interactive object policy."
+  (appkit-markup-ui-insert-document
+   document
+   :final-newline-p t
+   :interactive-p t
+   :link-action #'zulip-feed--markup-link-action
+   :object-inserter #'zulip-feed--insert-markup-object))
+
+(defun zulip-feed--insert-markup-object (node)
+  "Insert one Zulip provider object NODE with native actions."
+  (let* ((value (zulip-feed--markup-value node))
+         (kind (and value (zulip-markup-provider-object-kind value)))
+         (data (and value (zulip-markup-provider-object-data value))))
+    (pcase kind
+      ((or 'channel-link 'topic-link 'message-link)
+       (zulip-feed--insert-markup-fallback
+        node 'zulip-message-navigation-face
+        (zulip-feed--markup-navigation-action kind data)))
+      ('user-mention
+       (let* ((id (plist-get data :id))
+              (user-id
+               (and (stringp id)
+                    (string-match-p "\\`[1-9][0-9]*\\'" id)
+                    (string-to-number id)))
+              (label (zulip-feed--markup-fallback-text node))
+              (action
+               (and user-id
+                    (lambda ()
+                      (zulip-feed-open
+                       zulip-feed--account
+                       (zulip-narrow-direct user-id label))))))
+         (zulip-feed--insert-markup-fallback
+          node
+          (if (plist-get data :silent-p)
+              'zulip-message-silent-mention-face
+            'zulip-message-mention-face)
+          action)))
+      ((or 'group-mention 'wildcard-mention)
+       (zulip-feed--insert-markup-fallback
+        node
+        (if (plist-get data :silent-p)
+            'zulip-message-silent-mention-face
+          'zulip-message-mention-face)))
+      ('timestamp
+       (let* ((datetime (plist-get data :datetime))
+              (label
+               (condition-case nil
+                   (format-time-string
+                    "%Y-%m-%d %H:%M %Z" (date-to-time datetime))
+                 (error (zulip-feed--markup-fallback-text node))))
+              (start (point)))
+         (insert label)
+         (add-face-text-property
+          start (point) 'zulip-message-timestamp-face 'append)))
+      ('spoiler
+       (let* ((header (plist-get data :header))
+              (content (plist-get data :content))
+              (header-start (point)))
+         (when (appkit-markup-document-p header)
+           (zulip-feed--insert-markup-document header))
+         (add-face-text-property
+          header-start (point) 'zulip-message-spoiler-face 'append)
+         ;; Initial native cutover preserves the old visible-content behavior.
+         ;; The object boundary retains enough semantics for later reveal state.
+         (when (appkit-markup-document-p content)
+           (zulip-feed--insert-markup-document content))))
+      ('media
+       (zulip-feed--insert-markup-fallback
+        node 'zulip-message-media-face
+        (when-let* ((url (or (plist-get data :url)
+                             (plist-get data :preview-url))))
+          (lambda () (browse-url url)))))
+      ('emoji
+       (zulip-feed--insert-markup-fallback node))
+      (_
+       (if (appkit-markup-object-block-p node)
+           (zulip-feed--insert-markup-document
+            (appkit-markup-document
+             (appkit-markup-object-block-fallback node)))
+         (zulip-feed--insert-markup-fallback node))))))
+
 (defun zulip-feed--insert-message-body (message)
-  "Insert MESSAGE body, preserving local Markdown as literal text."
+  "Insert MESSAGE body through the Appkit semantic markup boundary.
+
+Local optimistic content is Markdown source and remains literal until the
+server returns authoritative rendered HTML."
   (let ((local-content (zulip-feed--field message 'local-content))
         (content
          (format "%s"
@@ -621,11 +804,16 @@ Both Lisp hyphen names and API underscore names are accepted."
     (if (and (stringp local-content)
              (not (zulip-feed--true-p
                    (zulip-feed--field message 'authoritative))))
-        ;; An optimistic row is Markdown source, not server-rendered HTML.
         (insert local-content)
-      (zulip-render-insert-html
-       content :base-url (and (zulip-account-p zulip-feed--account)
-                              (zulip-account-server zulip-feed--account))))))
+      (appkit-markup-ui-insert-document
+       (zulip-markup-parse
+        content
+        (and (zulip-account-p zulip-feed--account)
+             (zulip-account-server zulip-feed--account)))
+       :final-newline-p nil
+       :interactive-p t
+       :link-action #'zulip-feed--markup-link-action
+       :object-inserter #'zulip-feed--insert-markup-object))))
 
 (defun zulip-feed--reaction-groups (message)
   "Return grouped reaction display records for MESSAGE."
@@ -682,11 +870,33 @@ Both Lisp hyphen names and API underscore names are accepted."
      :action (lambda () (zulip-feed-open-message-context message))
      :help-echo "Open this Zulip topic or direct conversation")))
 
-(defun zulip-feed--insert-message-content (message prefix)
-  "Insert MESSAGE content and apply Appkit line PREFIX geometry."
+(cl-defun zulip-feed--insert-message-content
+    (message prefix
+             &key timestamp target-width left-prefix-width starred-p)
+  "Insert MESSAGE content and apply Appkit line PREFIX geometry.
+
+When TIMESTAMP is non-nil, append it at the right edge of the first content
+line.  TARGET-WIDTH and LEFT-PREFIX-WIDTH use the same geometry contract as
+`appkit-chat-ins-insert-right-aligned-text'."
   (let ((start (point)))
     (zulip-feed--insert-message-body message)
     (unless (bolp) (insert "\n"))
+    (when (and (stringp timestamp)
+               (not (string-empty-p timestamp))
+               (< start (point)))
+      (save-excursion
+        (goto-char start)
+        (end-of-line)
+        (let ((span
+               (appkit-chat-ins-insert-right-aligned-text
+                (concat timestamp (if starred-p " ★" ""))
+                target-width
+                :face 'zulip-message-timestamp-face
+                :left-prefix-width left-prefix-width)))
+          (when starred-p
+            (add-face-text-property
+             (1- (cdr span)) (cdr span)
+             'font-lock-constant-face 'append)))))
     (appkit-ui-apply-line-prefix start (point) prefix)))
 
 (defun zulip-feed--row-printer (row)
@@ -727,17 +937,13 @@ Both Lisp hyphen names and API underscore names are accepted."
        "Unread" 'zulip-message-unread-divider-face width properties))
     (if compact
         (progn
-          (let ((line-start (point)))
-            (insert (propertize (zulip-feed--message-time-label message t)
-                                'face 'zulip-message-timestamp-face)
-                    (if starred
-                        (propertize "  ★  " 'face 'font-lock-constant-face
-                                    'help-echo "Starred Zulip message")
-                      "  "))
-            (appkit-ui-apply-line-prefix
-             line-start (point) body-prefix))
           (zulip-feed--insert-breadcrumb message breadcrumb body-prefix)
-          (zulip-feed--insert-message-content message body-prefix))
+          (zulip-feed--insert-message-content
+           message body-prefix
+           :timestamp (zulip-feed--message-time-label message t)
+           :target-width width
+           :left-prefix-width (string-width rest-body-prefix)
+           :starred-p starred))
       (let ((heading-start (point))
             (sender-face (zulip-feed--message-sender-face message)))
         (insert (propertize sender 'face sender-face))
@@ -2279,9 +2485,14 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
                       (zulip-feed--field message 'rendered-content)
                       (zulip-feed--field message 'content)
                       ""))
-         (plain (if local
-                    (format "%s" content)
-                  (zulip-render-plain-text (format "%s" content)))))
+         (plain
+          (if local
+              (format "%s" content)
+            (zulip-markup-plain-text
+             (format "%s" content)
+             (and (zulip-account-p zulip-feed--account)
+                  (zulip-account-server zulip-feed--account))
+             t))))
     (kill-new plain)
     (message "Copied Zulip message")
     plain))
