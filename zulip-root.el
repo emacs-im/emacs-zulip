@@ -1421,21 +1421,19 @@ account topic cache."
       (message "Zulip: topic metadata is already refreshing"))))
 
 
-(defvar zulip-root-mode-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map appkit-directory-mode-map)
-    (define-key map (kbd "RET") #'zulip-root-open-at-point)
-    (define-key map [mouse-1] #'zulip-root-mouse-open-at-point)
-    (define-key map (kbd "n") #'zulip-root-next-row)
-    (define-key map (kbd "p") #'zulip-root-previous-row)
-    (define-key map (kbd "u") #'zulip-root-next-unread)
-    (define-key map (kbd "g") #'zulip-root-refresh)
-    (define-key map (kbd "/") #'zulip-root-open-destination)
-    (define-key map (kbd "m") #'zulip-root-open-new-direct-message)
-    (define-key map (kbd "s") #'zulip-root-search-messages)
-    (define-key map (kbd "t") #'zulip-root-open-topic)
-    map)
-  "Keymap for `zulip-root-mode'.")
+(defvar-keymap zulip-root-mode-map
+  :doc "Keymap for `zulip-root-mode'."
+  :parent appkit-directory-mode-map
+  "RET" #'zulip-root-open-at-point
+  "<mouse-1>" #'zulip-root-mouse-open-at-point
+  "n" #'zulip-root-next-row
+  "p" #'zulip-root-previous-row
+  "u" #'zulip-root-next-unread
+  "g" #'zulip-root-refresh
+  "/" #'zulip-root-open-destination
+  "m" #'zulip-root-open-new-direct-message
+  "s" #'zulip-root-search-messages
+  "t" #'zulip-root-open-topic)
 
 (define-derived-mode zulip-root-mode appkit-directory-mode "Zulip-Home"
   "Major mode for one account-scoped Zulip navigator."

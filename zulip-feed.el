@@ -2401,25 +2401,23 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
     (zulip-feed--maybe-auto-load-newer)
     (zulip-feed--maybe-auto-load-older)))
 
-(defvar zulip-feed-message-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "q") #'quit-window)
-    (define-key map (kbd "RET") #'zulip-feed-open-message-context)
-    (define-key map (kbd "o") #'zulip-feed-open-message-context)
-    (define-key map (kbd "t") #'zulip-feed-open-topic)
-    (define-key map (kbd "c") #'zulip-feed-copy-message)
-    (define-key map (kbd "n") #'zulip-feed-next-message)
-    (define-key map (kbd "p") #'zulip-feed-previous-message)
-    (define-key map (kbd "r") #'zulip-feed-mark-read)
-    (define-key map (kbd "u") #'zulip-feed-mark-unread)
-    (define-key map (kbd "s") #'zulip-feed-toggle-star)
-    (define-key map (kbd "R") #'zulip-feed-retry-send)
-    (define-key map (kbd "e") #'zulip-feed-edit-message)
-    (define-key map (kbd "d") #'zulip-feed-delete-message)
-    (define-key map (kbd "!") #'zulip-feed-toggle-reaction)
-    (define-key map (kbd "?") #'zulip-message-transient)
-    map)
-  "Single-key command map active over the generated timeline.")
+(defvar-keymap zulip-feed-message-map
+  :doc "Single-key command map active over the generated timeline."
+  "q" #'quit-window
+  "RET" #'zulip-feed-open-message-context
+  "o" #'zulip-feed-open-message-context
+  "t" #'zulip-feed-open-topic
+  "c" #'zulip-feed-copy-message
+  "n" #'zulip-feed-next-message
+  "p" #'zulip-feed-previous-message
+  "r" #'zulip-feed-mark-read
+  "u" #'zulip-feed-mark-unread
+  "s" #'zulip-feed-toggle-star
+  "R" #'zulip-feed-retry-send
+  "e" #'zulip-feed-edit-message
+  "d" #'zulip-feed-delete-message
+  "!" #'zulip-feed-toggle-reaction
+  "?" #'zulip-message-transient)
 
 (define-minor-mode zulip-feed-timeline-mode
   "Use point-local message commands outside the Zulip composer."
@@ -2427,26 +2425,24 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
   :lighter nil
   :keymap zulip-feed-message-map)
 
-(defvar zulip-feed-mode-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map appkit-chatbuf-mode-map)
-    (define-key map (kbd "RET") #'zulip-feed-return-dwim)
-    (define-key map (kbd "TAB") #'zulip-completion-complete)
-    (define-key map (kbd "<tab>") #'zulip-completion-complete)
-    (define-key map (kbd "C-M-i") #'zulip-completion-complete)
-    (define-key map (kbd "M-p") #'zulip-feed-draft-previous)
-    (define-key map (kbd "M-n") #'zulip-feed-draft-next)
-    (define-key map (kbd "C-c '") #'zulip-feed-edit-draft)
-    (define-key map (kbd "C-c C-k") #'zulip-feed-cancel-edit)
-    (define-key map (kbd "C-c C-a") #'zulip-message-transient)
-    (define-key map (kbd "C-c C-t") #'zulip-feed-open-topic)
-    (define-key map (kbd "C-c RET") #'zulip-feed-send-message)
-    (define-key map (kbd "C-c C-c") #'zulip-feed-send-message)
-    (define-key map (kbd "M-g p") #'zulip-feed-load-older)
-    (define-key map (kbd "M-g n") #'zulip-feed-load-newer)
-    (define-key map (kbd "C-c C-l") #'zulip-feed-load-latest)
-    map)
-  "Keymap for `zulip-feed-mode'.")
+(defvar-keymap zulip-feed-mode-map
+  :doc "Keymap for `zulip-feed-mode'."
+  :parent appkit-chatbuf-mode-map
+  "RET" #'zulip-feed-return-dwim
+  "TAB" #'zulip-completion-complete
+  "<tab>" #'zulip-completion-complete
+  "C-M-i" #'zulip-completion-complete
+  "M-p" #'zulip-feed-draft-previous
+  "M-n" #'zulip-feed-draft-next
+  "C-c '" #'zulip-feed-edit-draft
+  "C-c C-k" #'zulip-feed-cancel-edit
+  "C-c C-a" #'zulip-message-transient
+  "C-c C-t" #'zulip-feed-open-topic
+  "C-c RET" #'zulip-feed-send-message
+  "C-c C-c" #'zulip-feed-send-message
+  "M-g p" #'zulip-feed-load-older
+  "M-g n" #'zulip-feed-load-newer
+  "C-c C-l" #'zulip-feed-load-latest)
 
 (defun zulip-feed--reset-view-local-state ()
   "Reset controller state owned by one concrete feed view.

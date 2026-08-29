@@ -12,7 +12,7 @@
 (source "gnu")
 (source 'melpa)
 
-(depends-on "emacs" "27.1")
+(depends-on "emacs" "29.1")
 (depends-on "plz" "0.8")
 (depends-on "transient" "0.7")
 (depends-on "appkit" :file "../appkit.el")
