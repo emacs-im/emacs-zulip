@@ -176,8 +176,9 @@ mention counts are clickable shortcuts into the account navigator.
 
 ## Current limitations
 
-The Appkit lifecycle, view ownership, timeline, history, composer, completion,
-layout, mode-line, and avatar infrastructure are integrated.  Sender avatars
+The Appkit 0.2.18 lifecycle, view ownership, sectioned directory, timeline,
+history, chat buffer, completion, responsive layout, mode-line, and avatar
+infrastructure are integrated.  Sender avatars
 use an account-owned Zulip adapter over Appkit's resource acquisition and disk
 cache: rows retain stable initials geometry while loading, credentials are sent
 only to same-origin realm URLs, and completion invalidates only sender-dependent
