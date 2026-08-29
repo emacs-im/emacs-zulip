@@ -731,7 +731,7 @@ The authenticated user remains present for a self-DM."
       :icon-inserter (lambda () (insert (zulip-root--row-icon type)))
       :context (zulip-root--entry-title entry)
       :context-trail (zulip-root--trail unread mentions muted-p)
-      :preview (zulip-root--entry-preview entry)
+      :preview (appkit-ui-one-line-preview-create :text (zulip-root--entry-preview entry))
       :time (zulip-root--entry-time entry)
       :time-face 'shadow
       :line-properties
