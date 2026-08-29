@@ -83,20 +83,7 @@
   (interactive)
   (zulip-mode-line--open-root)
   (when (derived-mode-p 'zulip-root-mode)
-    (unless
-        (zulip-root--move-linewise
-         1
-         (lambda ()
-           (and (zulip-root--entry-at-point)
-                (> (or (get-text-property
-                        (point) 'zulip-root-mention-count)
-                       0)
-                   0)
-                (not (eq (get-text-property
-                          (point) 'zulip-root-row-type)
-                         'all))))
-         t)
-      (message "Zulip: no unread mentions in this account"))))
+    (zulip-root-next-mentioned)))
 
 (defun zulip-mode-line-icon ()
   "Return the clickable Zulip mode-line label."

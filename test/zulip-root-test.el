@@ -108,7 +108,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
 (defun zulip-root-test--row-position (key)
   "Return the current root buffer position carrying stable row KEY."
   (appkit-position-find-property-value
-   (point-min) (point-max) zulip-root--anchor-property key))
+   (point-min) (point-max) appkit-directory-key-property key))
 
 (defun zulip-root-test--topics-result (&rest topics)
   "Return one successful API result containing TOPICS."
@@ -124,7 +124,9 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
                (actionable-keys
                 (mapcar #'zulip-root--entry-key
                         (seq-filter #'zulip-root--entry-target first)))
-               (node-table zulip-root--node-table)
+               (node-table
+                (appkit-directory-surface-node-table
+                 (appkit-directory-surface)))
                (nodes
                 (mapcar (lambda (key) (gethash key node-table))
                         actionable-keys)))
@@ -177,8 +179,12 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
           (zulip-root--invalidate-and-sync)
           (should
            (cl-every #'eq nodes
-                     (mapcar (lambda (key)
-                               (gethash key zulip-root--node-table))
+                     (mapcar
+                      (lambda (key)
+                        (gethash
+                         key
+                         (appkit-directory-surface-node-table
+                          (appkit-directory-surface))))
                              actionable-keys))))))))
 
 (ert-deftest zulip-root-projects-exact-unread-and-mention-counts ()
@@ -370,8 +376,11 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
             (should (= (* channel-count 25) topic-count))
             (should (= channel-count hidden-note-count))
             (should (< (length entries) 900))
-            (should (= (length entries)
-                       (hash-table-count zulip-root--node-table)))
+            (should
+             (= (length entries)
+                (hash-table-count
+                 (appkit-directory-surface-node-table
+                  (appkit-directory-surface)))))
             (should (< (line-number-at-pos (point-max)) 900))))))))
 
 (ert-deftest zulip-root-message-preview-decodes-entities-and-flattens-blocks ()
@@ -498,7 +507,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
       (appkit-sync-invalidations view)
       (with-current-buffer buffer
         (should (equal (get-text-property
-                        (point) zulip-root--anchor-property)
+                        (point) appkit-directory-key-property)
                        '(topic "5" "one")))
         (should (= old-column (current-column)))
         (should (= 3 (get-text-property

@@ -232,11 +232,6 @@ makes both materialization and ACTION inert."
 
 (defun zulip-feed--update-edit-read-only-state ()
   "Reflect the current edit owner/barrier in `buffer-read-only'."
-  ;; A failed mutation hook is disabled by Emacs.  Projection is the safe
-  ;; boundary at which to reassert both composer hooks before accepting the
-  ;; next user edit, whether this transaction locks or unlocks the buffer.
-  (add-hook 'before-change-functions #'zulip-feed--before-change nil t)
-  (add-hook 'after-change-functions #'zulip-feed--after-change nil t)
   (setq-local buffer-read-only
               (and (zulip-feed--edit-composer-busy-p)
                    t)))
@@ -483,26 +478,14 @@ Both Lisp hyphen names and API underscore names are accepted."
      (concat (if (string-empty-p (or first "")) "@" (substring first 0 1))
              (if (or (null last) (equal first last)) "" (substring last 0 1))))))
 
-(defun zulip-feed--display-window ()
-  "Return a live window suitable for measuring the current feed."
-  (let ((selected (selected-window)))
-    (or (and (window-live-p selected)
-             (eq (window-buffer selected) (current-buffer))
-             selected)
-        (car (get-buffer-window-list (current-buffer) nil 'visible))
-        (car (get-buffer-window-list (current-buffer) nil t)))))
-
-(defun zulip-feed--stable-fill-column ()
-  "Return a stable presentation width for the current feed."
-  (or (when-let* ((window (zulip-feed--display-window)))
-        (appkit-view-window-fill-column window 2))
-      (and (integerp zulip-feed--fill-column) zulip-feed--fill-column)
-      80))
-
 (defun zulip-feed--update-fill-column ()
-  "Refresh and return the current feed's stable presentation width."
+  "Refresh and return the current feed's responsive presentation width."
   (setq-local zulip-feed--fill-column
-              (max 40 (zulip-feed--stable-fill-column))))
+              (max 40
+                   (or (appkit-view-responsive-width 2)
+                       (and (integerp zulip-feed--fill-column)
+                            zulip-feed--fill-column)
+                       80))))
 
 (defun zulip-feed--messages-compact-p (previous message)
   "Return non-nil when MESSAGE may visually continue PREVIOUS."
@@ -885,7 +868,8 @@ timeline flush with the top of the buffer like telega chat buffers."
    :printer #'zulip-feed--row-printer
    :anchor-property zulip-feed--anchor-property
    :header (zulip-feed--header-text)
-   :footer (zulip-feed--footer-text)))
+   :footer (zulip-feed--footer-text)
+   :after-mutation-function #'appkit-chatbuf-update-context-mode))
 
 (defun zulip-feed--project-rows ()
   "Project current ordered state entries into Appkit rows."
@@ -1057,7 +1041,15 @@ timeline flush with the top of the buffer like telega chat buffers."
   "Synchronize VIEW from coalesced Appkit INVALIDATIONS."
   (let* ((events (appkit-view-pending-events-snapshot view))
          (rekeys (zulip-feed--apply-queued-events events))
-         (force-keys (appkit-invalidations-entry-keys invalidations))
+         (geometry-p
+          (memq 'geometry (appkit-invalidations-parts invalidations)))
+         (force-keys
+          (delete-dups
+           (append
+            (appkit-invalidations-entry-keys invalidations)
+            (and geometry-p
+                 (appkit-chat-timeline-live-p)
+                 (appkit-chat-timeline-keys)))))
          (changed-resources
           (appkit-invalidations-resource-keys invalidations)))
     (zulip-feed--cleanup-pending-read-ids)
@@ -1735,31 +1727,6 @@ human-readable composer projection used for optimistic display."
          :queue-id queue-id)
         local-id))))
 
-(defun zulip-feed--after-change (beg end old-length)
-  "Maintain composer after BEG to END replaces OLD-LENGTH characters."
-  (appkit-chatbuf-after-change
-   beg end :old-length old-length
-   :rendering-p (appkit-chatbuf-rendering-p)
-   :sync-function #'appkit-chatbuf-input-state-sync))
-
-(defun zulip-feed--before-change (beg end)
-  "Reject user changes from BEG to END outside the trailing composer.
-
-Appkit keeps the buffer writable so its tail can be an ordinary Emacs editing
-region.  Generated timeline, header, and footer mutations run inside an Appkit
-render transaction; every other change must be wholly inside the composer.
-An edit GET/PATCH owner and its callback-to-sync materialization barrier make
-that composer temporarily immutable so user input cannot race server state."
-  (unless (appkit-chatbuf-rendering-p)
-    (when (zulip-feed--edit-composer-busy-p)
-      (signal 'text-read-only
-              '("Zulip edit composer is busy")))
-    (let ((bounds (appkit-chatbuf-input-region-bounds)))
-      (unless (and bounds
-                   (<= (car bounds) beg)
-                   (<= beg end)
-                   (<= end (cdr bounds)))
-        (signal 'text-read-only '("Zulip generated content is read-only"))))))
 
 (defun zulip-feed-message-id-at-point (&optional position)
   "Return the stable message ID at POSITION or point."
@@ -2376,6 +2343,7 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
         (zulip-feed-edit-draft))
     (user-error (user-error "Not browsing Zulip input history"))))
 
+
 (defun zulip-feed-return-dwim (argument)
   "Open context, complete/send the draft, or insert newline with ARGUMENT."
   (interactive "P")
@@ -2426,33 +2394,12 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
         (zulip-feed--manage-read-position position))
       (zulip-feed--maybe-auto-load-newer position))))
 
-(defun zulip-feed--update-context-mode ()
-  "Enable timeline single-key commands only outside the composer."
-  (let ((timeline-p (not (appkit-chatbuf-point-in-input-p))))
-    (unless (eq zulip-feed-timeline-mode timeline-p)
-      (zulip-feed-timeline-mode (if timeline-p 1 -1)))))
-
 (defun zulip-feed--post-command ()
-  "Maintain composer boundaries, context keys, and automatic paging."
+  "Maintain Zulip read state and automatic paging."
   (unless (appkit-chatbuf-rendering-p)
-    (appkit-chatbuf-post-command-clamp-point)
-    (zulip-feed--update-context-mode)
     (zulip-feed--manage-read-position)
     (zulip-feed--maybe-auto-load-newer)
     (zulip-feed--maybe-auto-load-older)))
-
-(defun zulip-feed--on-window-size-change (&optional _frame)
-  "Reflow visible feed rows when their presentation width changes."
-  (when (and (derived-mode-p 'zulip-feed-mode)
-             (appkit-chat-timeline-live-p))
-    (let ((old zulip-feed--fill-column)
-          (next (max 40 (zulip-feed--stable-fill-column))))
-      (unless (equal old next)
-        (setq-local zulip-feed--fill-column next)
-        (let ((view (appkit-current-view)))
-          (when (appkit-view-live-p view)
-            (appkit-request-sync
-             view :entries (appkit-chat-timeline-keys) :part 'timeline)))))))
 
 (defvar zulip-feed-message-map
   (let ((map (make-sparse-keymap)))
@@ -2482,15 +2429,11 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
 
 (defvar zulip-feed-mode-map
   (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map appkit-chatbuf-mode-map)
     (define-key map (kbd "RET") #'zulip-feed-return-dwim)
     (define-key map (kbd "TAB") #'zulip-completion-complete)
     (define-key map (kbd "<tab>") #'zulip-completion-complete)
     (define-key map (kbd "C-M-i") #'zulip-completion-complete)
-    (define-key map (kbd "DEL") #'appkit-chatbuf-input-backward-delete)
-    (define-key map (kbd "<backspace>")
-                #'appkit-chatbuf-input-backward-delete)
-    (define-key map (kbd "C-d") #'appkit-chatbuf-input-forward-delete)
-    (define-key map (kbd "<delete>") #'appkit-chatbuf-input-forward-delete)
     (define-key map (kbd "M-p") #'zulip-feed-draft-previous)
     (define-key map (kbd "M-n") #'zulip-feed-draft-next)
     (define-key map (kbd "C-c '") #'zulip-feed-edit-draft)
@@ -2530,25 +2473,18 @@ path while leaving account-owned optimistic sends in their shared table."
   (setq-local buffer-read-only nil)
   (setq-local zulip-feed-timeline-mode nil))
 
-(define-derived-mode zulip-feed-mode nil "Zulip-Feed"
+(define-derived-mode zulip-feed-mode appkit-chatbuf-mode "Zulip-Feed"
   "Major mode for one Appkit-backed Zulip narrow."
-  (appkit-chatbuf-mode-setup)
   (setq-local line-spacing 0)
   (zulip-feed--reset-view-local-state)
+  (setq-local appkit-chatbuf-input-sync-function
+              #'appkit-chatbuf-input-state-sync)
   (setq-local buffer-read-only nil)
   (setq-local truncate-lines nil)
-  (setq-local switch-to-buffer-preserve-window-point nil)
   (setq-local header-line-format '(:eval (zulip-feed--header-line)))
-  (add-hook 'before-change-functions #'zulip-feed--before-change nil t)
-  (add-hook 'after-change-functions #'zulip-feed--after-change nil t)
-  (add-hook 'post-command-hook #'zulip-feed--post-command nil t)
-  (add-hook 'window-scroll-functions #'zulip-feed--window-scroll nil t)
-  (add-hook 'window-size-change-functions
-            #'zulip-feed--on-window-size-change nil t)
-  (add-hook 'display-line-numbers-mode-hook
-            #'zulip-feed--on-window-size-change nil t)
-  (add-hook 'text-scale-mode-hook #'zulip-feed--on-window-size-change nil t)
-  (zulip-feed--update-context-mode))
+  (appkit-chatbuf-use-timeline-mode #'zulip-feed-timeline-mode)
+  (add-hook 'post-command-hook #'zulip-feed--post-command t t)
+  (add-hook 'window-scroll-functions #'zulip-feed--window-scroll nil t))
 
 (defun zulip-feed--view-id (account narrow)
   "Return server-qualified Appkit view identity for ACCOUNT and NARROW."
@@ -2580,9 +2516,10 @@ path while leaving account-owned optimistic sends in their shared table."
            :buffer-name (zulip-feed--buffer-name account narrow)
            :state narrow
            :sync-function #'zulip-feed--sync-invalidations
-           :parts '(frame timeline composer history)
+           :parts '(frame timeline composer history geometry)
            :setup
-           (lambda (_view)
+           (lambda (new-view)
+             (appkit-view-enable-responsive-geometry new-view)
              ;; `appkit-open-view' initializes a major mode only once per
              ;; buffer, but SETUP runs for every newly attached view.  A dead
              ;; predecessor must not lend its history owner, edit request,
@@ -2594,7 +2531,7 @@ path while leaving account-owned optimistic sends in their shared table."
              (zulip-completion-setup account)
              (appkit-chat-history-window-clear)
              (zulip-feed-render)
-             (zulip-feed--update-context-mode)))))
+             (appkit-chatbuf-update-context-mode)))))
     (with-current-buffer (appkit-view-buffer view)
       (setq-local zulip-feed--account account
                   zulip-feed--narrow narrow)
@@ -2613,6 +2550,7 @@ path while leaving account-owned optimistic sends in their shared table."
                   (appkit-chat-history-loading-p))
         (zulip-feed-load-initial)))
     (pop-to-buffer buffer)
+    (appkit-view-refresh-responsive-geometry)
     buffer))
 
 (defun zulip-feed-open-message (account narrow message-id)
@@ -2633,6 +2571,7 @@ path while leaving account-owned optimistic sends in their shared table."
          'around message-id before
          (max 0 (- zulip-history-page-size before 1)))))
     (pop-to-buffer buffer)
+    (appkit-view-refresh-responsive-geometry)
     buffer))
 
 (provide 'zulip-feed)

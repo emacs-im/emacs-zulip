@@ -1159,16 +1159,17 @@
                                (appkit-view-request-table
                                 (appkit-current-view))))))))))
 
-(ert-deftest zulip-feed-installs-appkit-completion-and-input-history-keys ()
+(ert-deftest zulip-feed-uses-appkit-chatbuf-completion-and-history-adapters ()
   (zulip-feed-test--with-account account
     (let ((buffer (zulip-feed--open-buffer
                    account (zulip-narrow-topic 7 "client"))))
       (with-current-buffer buffer
+        (should (derived-mode-p 'appkit-chatbuf-mode))
         (should (memq 'zulip-completion-mention-capf
                       completion-at-point-functions))
         (should (memq 'appkit-chat-emoji-capf
                       completion-at-point-functions))
-        (should (eq (lookup-key zulip-feed-mode-map (kbd "M-p"))
+        (should (eq (key-binding (kbd "M-p"))
                     #'zulip-feed-draft-previous))
         (should (eq (lookup-key zulip-feed-mode-map (kbd "C-c C-a"))
                     #'zulip-message-transient))
@@ -1492,9 +1493,6 @@
             (should-not zulip-feed--edit-sync-request)
             (should buffer-read-only)
             (should-not (appkit-chatbuf-rendering-p))
-            (ert-info ("GET hook before blocked mutation")
-              (should (memq #'zulip-feed--before-change
-                            before-change-functions)))
             (let ((undo-before buffer-undo-list))
               (goto-char (point-max))
               (should-error (insert " GET race")
@@ -1502,9 +1500,6 @@
               (should-error (zulip-feed-draft-previous)
                             :type 'user-error)
               (should (equal buffer-undo-list undo-before)))
-            (ert-info ("GET hook after blocked mutation")
-              (should (memq #'zulip-feed--before-change
-                            before-change-functions)))
             (dolist (input (list (appkit-chatbuf-input-string)
                                  (appkit-chatbuf-input-state)))
               (should (equal input "@Ada protected draft"))
@@ -1521,9 +1516,6 @@
                       :ok-p t :data '((raw_content . "raw source"))))
             (appkit-sync-invalidations (appkit-current-view))
             (should-not buffer-read-only)
-            (ert-info ("GET hook after source materialization")
-              (should (memq #'zulip-feed--before-change
-                            before-change-functions)))
             (should (equal (appkit-chatbuf-input-string) "raw source"))
             (zulip-feed-cancel-edit)
             (appkit-sync-invalidations (appkit-current-view))
@@ -1580,13 +1572,7 @@
             (should-not buffer-read-only)
             (should (equal (appkit-chatbuf-input-string) "raw source"))
             (appkit-chatbuf-input-set-text "edited raw source")
-            (ert-info ("PATCH hook after editable input")
-              (should (memq #'zulip-feed--before-change
-                            before-change-functions)))
             (zulip-feed-submit-edit)
-            (ert-info ("PATCH hook before frame sync")
-              (should (memq #'zulip-feed--before-change
-                            before-change-functions)))
             (should (equal patch-content "edited raw source"))
             ;; A frame-only sync must not accidentally unlock the composer
             ;; while PATCH still owns this generation.
@@ -1595,9 +1581,6 @@
             (should-not zulip-feed--edit-sync-request)
             (should buffer-read-only)
             (should-not (appkit-chatbuf-rendering-p))
-            (ert-info ("PATCH hook before blocked mutation")
-              (should (memq #'zulip-feed--before-change
-                            before-change-functions)))
             (let ((undo-before buffer-undo-list))
               (goto-char (point-max))
               (should-error (insert " PATCH race")

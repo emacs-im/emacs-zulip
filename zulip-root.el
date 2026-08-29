@@ -12,15 +12,12 @@
 
 (require 'button)
 (require 'cl-lib)
-(require 'ewoc)
 (require 'seq)
 (require 'subr-x)
 (require 'appkit-core)
-(require 'appkit-ewoc)
+(require 'appkit-directory)
 (require 'appkit-invalidation)
-(require 'appkit-position)
 (require 'appkit-task-queue)
-(require 'appkit-transaction)
 (require 'appkit-ui)
 (require 'appkit-view)
 (require 'zulip-api)
@@ -62,17 +59,10 @@
   '(zulip-root topic-errors)
   "App resource-store key for account-scoped topic hydration errors.")
 
-(defconst zulip-root--anchor-property 'zulip-root-entry-key
-  "Text property carrying a root row's stable projection key.")
 
 (defvar-local zulip-root--account nil
   "Zulip account owning the current navigator buffer.")
 
-(defvar-local zulip-root--ewoc nil
-  "Persistent EWOC containing the current navigator projection.")
-
-(defvar-local zulip-root--node-table nil
-  "Stable entry-key to EWOC-node table for the current navigator.")
 
 (defvar-local zulip-root--fill-column nil
   "Last usable row width measured from a window displaying this root.")
@@ -719,9 +709,8 @@ The authenticated user remains present for a self-DM."
     (_ " ")))
 
 (defun zulip-root--insert-action-entry (entry)
-  "Insert openable root ENTRY as an Appkit action row."
-  (let* ((start (point))
-         (type (zulip-root--entry-type entry))
+  "Insert one openable root ENTRY."
+  (let* ((type (zulip-root--entry-type entry))
          (unread (or (zulip-root--entry-unread-count entry) 0))
          (mentions (or (zulip-root--entry-mention-count entry) 0))
          (muted-p (zulip-root--entry-muted-p entry))
@@ -731,12 +720,12 @@ The authenticated user remains present for a self-DM."
       :icon-inserter (lambda () (insert (zulip-root--row-icon type)))
       :context (zulip-root--entry-title entry)
       :context-trail (zulip-root--trail unread mentions muted-p)
-      :preview (appkit-ui-one-line-preview-create :text (zulip-root--entry-preview entry))
+      :preview (appkit-ui-one-line-preview-create
+                :text (zulip-root--entry-preview entry))
       :time (zulip-root--entry-time entry)
       :time-face 'shadow
       :line-properties
-      (list zulip-root--anchor-property (zulip-root--entry-key entry)
-            'zulip-root-entry entry
+      (list 'zulip-root-entry entry
             'zulip-root-row-type type
             'zulip-root-unread-count unread
             'zulip-root-mention-count mentions
@@ -746,10 +735,7 @@ The authenticated user remains present for a self-DM."
      :indent (or (zulip-root--entry-indent entry) 1)
      :width (or (zulip-root--entry-width entry) 80)
      :icon-slot-width zulip-root--icon-slot-width
-     :context-width-spec '(0.34 18 36))
-    (appkit-ui-make-action-row
-     start (point) entry #'zulip-root--activate-entry
-     :help-echo help :mouse-face 'highlight)))
+     :context-width-spec '(0.34 18 36))))
 
 (defun zulip-root--entry-printer (entry)
   "Insert one persistent root ENTRY."
@@ -765,6 +751,55 @@ The authenticated user remains present for a self-DM."
     ((or 'all 'mentioned 'starred 'channel 'topic 'dm)
      (zulip-root--insert-action-entry entry))
     (type (error "Unknown Zulip root entry type: %S" type))))
+
+(defun zulip-root--entry-section-key (entry)
+  "Return the Appkit directory section owning projected ENTRY."
+  (pcase (zulip-root--entry-type entry)
+    ((or 'all 'mentioned 'starred) 'messages-heading)
+    ((or 'channel 'topic) 'channels-heading)
+    ('dm 'dm-heading)))
+
+(defun zulip-root--directory-entry (entry)
+  "Adapt protocol-owned root ENTRY to an Appkit directory entry."
+  (let* ((type (zulip-root--entry-type entry))
+         (item-p (memq type '(all mentioned starred channel topic dm)))
+         (unread-p
+          (and item-p
+               (not (eq type 'all))
+               (> (or (zulip-root--entry-unread-count entry) 0) 0))))
+    (appkit-directory-entry-create
+     :key (zulip-root--entry-key entry)
+     :role (cond ((eq type 'heading) 'section)
+                 (item-p 'item)
+                 (t 'note))
+     :section-key (and item-p (zulip-root--entry-section-key entry))
+     :label (zulip-root--entry-title entry)
+     :item-p item-p
+     :unread-p unread-p
+     :payload entry
+     :stamp entry
+     :help-echo (and item-p
+                     (format "Open %s" (zulip-root--entry-title entry)))
+     :mouse-face (and item-p 'highlight))))
+
+(defun zulip-root--insert-directory-entry (_surface directory-entry)
+  "Render one DIRECTORY-ENTRY using Zulip's one-line presentation."
+  (zulip-root--entry-printer
+   (appkit-directory-entry-payload directory-entry))
+  t)
+
+(defun zulip-root--activate-directory-entry (_surface directory-entry)
+  "Open the Zulip destination carried by DIRECTORY-ENTRY."
+  (zulip-root--activate-entry
+   (appkit-directory-entry-payload directory-entry)))
+
+(defun zulip-root--configure-directory ()
+  "Configure the current Appkit directory surface for Zulip."
+  (appkit-directory-configure
+   (appkit-directory-surface)
+   :entry-inserter #'zulip-root--insert-directory-entry
+   :activate-function #'zulip-root--activate-directory-entry
+   :action-rows-p t))
 
 (defun zulip-root--project-entries (&optional all-topics-p)
   "Project the current account state into stable root entries.
@@ -937,71 +972,46 @@ to `zulip-root-visible-topics-per-channel'."
           :width width))))
     (nreverse entries)))
 
-(defun zulip-root--selected-window ()
-  "Return the selected window when it displays the current root buffer."
-  (let ((window (selected-window)))
-    (and (window-live-p window)
-         (eq (window-buffer window) (current-buffer))
-         window)))
-
-(defun zulip-root--display-window ()
-  "Return the widest live window displaying the current root buffer."
-  (let ((best nil) (best-width -1))
-    (dolist (window (get-buffer-window-list (current-buffer) nil t) best)
-      (let ((width (if (window-live-p window)
-                       (window-width window 'remap)
-                     -1)))
-        (when (> width best-width)
-          (setq best window best-width width))))))
-
-(defun zulip-root--compute-fill-column (&optional window)
-  "Compute root row width from live WINDOW, or return nil."
-  (when-let* ((window (or window (zulip-root--display-window)))
-              (width (appkit-view-window-fill-column window 3)))
-    (max 60 width)))
-
-(defun zulip-root--stable-fill-column ()
-  "Return stable width for the next root reconciliation."
-  (or (when-let* ((window (zulip-root--selected-window)))
-        (zulip-root--compute-fill-column window))
-      (and (integerp zulip-root--fill-column)
-           (> zulip-root--fill-column 0)
-           zulip-root--fill-column)
-      (zulip-root--compute-fill-column (zulip-root--display-window))
-      80))
+(defun zulip-root--update-fill-column ()
+  "Refresh and return the navigator's responsive presentation width."
+  (setq-local zulip-root--fill-column
+              (max 60
+                   (or (appkit-view-responsive-width 3)
+                       (and (integerp zulip-root--fill-column)
+                            zulip-root--fill-column)
+                       80))))
 
 (defun zulip-root--buffer-width ()
   "Return current root row width in columns."
-  (max 60 (or zulip-root--fill-column
-              (setq-local zulip-root--fill-column
-                          (zulip-root--stable-fill-column)))))
+  (zulip-root--update-fill-column))
 
 (defun zulip-root--sync (&optional force-keys)
   "Reconcile the current root, explicitly invalidating FORCE-KEYS."
-  (unless (ewoc-p zulip-root--ewoc)
-    (error "Zulip root view is not initialized"))
-  (let ((view (appkit-current-view))
-        (snapshot
-         (appkit-position-capture
-          :anchor-property zulip-root--anchor-property
-          :preserve-window-start t)))
+  (let ((view (appkit-current-view)))
     (unless (appkit-view-live-p view)
       (error "Zulip root sync requires a live Appkit view"))
-    (appkit-with-content-update view
-      (setq-local zulip-root--fill-column (zulip-root--stable-fill-column))
-      (setf (appkit-view-state view) (zulip-root--state))
-      (setq-local zulip-root--node-table
-                  (appkit-ewoc-reconcile
-                   zulip-root--ewoc
-                   (zulip-root--project-entries)
-                   #'zulip-root--entry-key
-                   :force-keys force-keys))
-      (when snapshot (appkit-position-restore snapshot)))))
+    (zulip-root--update-fill-column)
+    (setf (appkit-view-state view) (zulip-root--state))
+    (appkit-directory-reconcile
+     (appkit-directory-surface)
+     (mapcar #'zulip-root--directory-entry
+             (zulip-root--project-entries))
+     :force-keys force-keys
+     :preserve-position-p t)))
 
 (defun zulip-root--sync-invalidations (view invalidations)
   "Synchronize VIEW from coalesced INVALIDATIONS."
-  (let ((events (appkit-view-pending-events-snapshot view)))
-    (zulip-root--sync (appkit-invalidations-entry-keys invalidations))
+  (let* ((events (appkit-view-pending-events-snapshot view))
+         (geometry-p
+          (memq 'geometry (appkit-invalidations-parts invalidations)))
+         (force-keys
+          (delete-dups
+           (append
+            (appkit-invalidations-entry-keys invalidations)
+            (and geometry-p
+                 (mapcar #'zulip-root--entry-key
+                         (zulip-root--project-entries)))))))
+    (zulip-root--sync force-keys)
     (appkit-view-acknowledge-events view (length events))))
 
 (defun zulip-root--invalidate-and-sync (&optional force-keys)
@@ -1264,56 +1274,35 @@ for channels already represented in the account cache."
   (mouse-set-point event)
   (zulip-root-open-at-point))
 
-(defun zulip-root--move-linewise (direction predicate &optional wrap)
-  "Move in DIRECTION until PREDICATE succeeds, optionally WRAP once."
-  (let ((origin (point)) (wrapped nil) found)
-    (while (not found)
-      (forward-line direction)
-      (cond
-       ((and (> direction 0) (eobp))
-        (if (and wrap (not wrapped))
-            (progn (setq wrapped t) (goto-char (point-min)))
-          (setq found 'stop)))
-       ((and (< direction 0) (bobp))
-        (if (and wrap (not wrapped))
-            (progn
-              (setq wrapped t)
-              (goto-char (point-max))
-              (forward-line -1))
-          (setq found 'stop)))
-       ((funcall predicate) (setq found t))))
-    (unless (eq found t)
-      (goto-char origin)
-      nil)))
 
 (defun zulip-root-next-row ()
-  "Move to the next openable navigator row, wrapping once."
+  "Move to the next openable navigator row."
   (interactive)
-  (zulip-root--move-linewise
-   1 (lambda () (zulip-root--entry-at-point)) t))
+  (appkit-directory-next-item))
 
 (defun zulip-root-previous-row ()
-  "Move to the previous openable navigator row, wrapping once."
+  "Move to the previous openable navigator row."
   (interactive)
-  (zulip-root--move-linewise
-   -1 (lambda () (zulip-root--entry-at-point)) t))
+  (appkit-directory-previous-item))
 
 (defun zulip-root-next-unread ()
   "Move to the next unread channel, topic, or direct conversation."
   (interactive)
-  (unless (zulip-root--move-linewise
-           1
-           (lambda ()
-             (and (zulip-root--entry-at-point)
-                  (> (or (get-text-property
-                          (point) 'zulip-root-unread-count)
-                         0)
-                     0)
-                  (not (eq (get-text-property
-                            (point) 'zulip-root-row-type)
-                           'all))))
-           t)
-    (message "Zulip: no unread conversations")))
+  (appkit-directory-next-unread))
+
+(defun zulip-root-next-mentioned ()
+  "Move to the next destination with unread mentions."
+  (interactive)
+  (unless
+      (appkit-directory-move
+       (appkit-directory-surface)
+       (lambda (directory-entry)
+         (let ((entry (appkit-directory-entry-payload directory-entry)))
+           (and (zulip-root--entry-p entry)
+                (not (eq (zulip-root--entry-type entry) 'all))
+                (> (or (zulip-root--entry-mention-count entry) 0) 0))))
+       1 t)
+    (message "Zulip: no unread mentions in this account")))
 
 (defun zulip-root--completion-choices ()
   "Return completion labels paired with every known destination.
@@ -1431,31 +1420,10 @@ account topic cache."
                  started (if (= started 1) "" "s"))
       (message "Zulip: topic metadata is already refreshing"))))
 
-(defun zulip-root--reflow-visible (&optional force)
-  "Reflow visible root rows, invalidating all rows when FORCE is non-nil."
-  (when (derived-mode-p 'zulip-root-mode)
-    (when-let* ((window (or (zulip-root--selected-window)
-                            (zulip-root--display-window)))
-                (next (zulip-root--compute-fill-column window)))
-      (when (or force (not (equal next zulip-root--fill-column)))
-        (setq-local zulip-root--fill-column next)
-        (zulip-root--invalidate-and-schedule
-         (and force
-              (mapcar #'zulip-root--entry-key
-                      (seq-filter #'zulip-root--entry-target
-                                  (zulip-root--project-entries)))))
-        t))))
-
-(defun zulip-root--on-window-size-change (&optional _frame)
-  "Reflow a visible root after its window geometry changes."
-  (zulip-root--reflow-visible nil))
-
-(defun zulip-root--on-text-scale-change ()
-  "Reflow a visible root after text scaling changes."
-  (zulip-root--reflow-visible t))
 
 (defvar zulip-root-mode-map
   (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map appkit-directory-mode-map)
     (define-key map (kbd "RET") #'zulip-root-open-at-point)
     (define-key map [mouse-1] #'zulip-root-mouse-open-at-point)
     (define-key map (kbd "n") #'zulip-root-next-row)
@@ -1466,30 +1434,16 @@ account topic cache."
     (define-key map (kbd "m") #'zulip-root-open-new-direct-message)
     (define-key map (kbd "s") #'zulip-root-search-messages)
     (define-key map (kbd "t") #'zulip-root-open-topic)
-    (define-key map (kbd "q") #'quit-window)
     map)
   "Keymap for `zulip-root-mode'.")
 
-(define-derived-mode zulip-root-mode special-mode "Zulip-Home"
+(define-derived-mode zulip-root-mode appkit-directory-mode "Zulip-Home"
   "Major mode for one account-scoped Zulip navigator."
-  (setq buffer-read-only t
-        truncate-lines t)
-  (buffer-disable-undo)
-  (setq-local buffer-undo-list t)
   (setq-local switch-to-buffer-preserve-window-point nil)
   (setq-local zulip-root--fill-column nil)
   (setq-local zulip-root--topic-tasks nil)
-  (setq-local zulip-root--node-table (make-hash-table :test #'equal))
   (setq-local header-line-format '(:eval (zulip-root--header-line)))
-  (let ((inhibit-read-only t) (buffer-undo-list t))
-    (erase-buffer)
-    (setq-local zulip-root--ewoc
-                (ewoc-create #'zulip-root--entry-printer nil nil t)))
-  (add-hook 'window-size-change-functions
-            #'zulip-root--on-window-size-change nil t)
-  (add-hook 'display-line-numbers-mode-hook
-            #'zulip-root--on-window-size-change nil t)
-  (add-hook 'text-scale-mode-hook #'zulip-root--on-text-scale-change nil t))
+  (zulip-root--configure-directory))
 
 (defun zulip-root--open-buffer (account)
   "Open or reuse ACCOUNT's Appkit root view and return its buffer."
@@ -1507,9 +1461,11 @@ account topic cache."
            :buffer-name (zulip-root--buffer-name account)
            :state (zulip-account-state account)
            :sync-function #'zulip-root--sync-invalidations
-           :parts '(frame entries)
+           :parts '(frame entries geometry)
            :setup
            (lambda (new-view)
+             (appkit-view-enable-responsive-geometry new-view)
+             (zulip-root--configure-directory)
              (setq-local zulip-root--account account)
              ;; The buffer can survive a killed view.  Its replacement gets a
              ;; fresh owner-scoped queue; the old queue and task tokens die
@@ -1548,7 +1504,7 @@ account topic cache."
   (let ((buffer (zulip-root--open-buffer account)))
     (pop-to-buffer buffer)
     (with-current-buffer buffer
-      (zulip-root--reflow-visible nil)
+      (appkit-view-refresh-responsive-geometry)
       (unless (zulip-root--entry-at-point)
         (goto-char (point-min))
         (zulip-root-next-row)))
