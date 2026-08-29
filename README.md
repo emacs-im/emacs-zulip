@@ -191,21 +191,29 @@ mention counts are clickable shortcuts into the account navigator.
 
 ## Current limitations
 
-The Appkit 0.2.19 lifecycle, view ownership, sectioned directory, timeline,
-history, chat buffer, completion, responsive layout, mode-line, and avatar
-infrastructure are integrated.  Sender avatars
-use an account-owned Zulip adapter over Appkit's resource acquisition and disk
-cache: rows retain stable initials geometry while loading, credentials are sent
-only to same-origin realm URLs, and completion invalidates only sender-dependent
-rows.  The remaining rich-media adapters are not implemented yet:
+The Appkit 0.2.20 lifecycle, semantic markup, native UI, view ownership,
+sectioned directory, timeline, history, chat buffer, completion, responsive
+layout, mode-line, and avatar infrastructure are integrated.  Zulip's
+authoritative server-rendered HTML is parsed with libxml into Appkit Documents;
+message buffers do not use SHR.  User/group mentions, channel/topic/message
+links, timestamps, spoilers, emoji, media, and unsupported provider structures
+remain typed Zulip objects with safe visible fallbacks.  Links and Zulip
+navigation become native Appkit actions.
 
-- inline images and embedded media in server-rendered HTML are suppressed;
-- uploads, attachment previews, and download/open actions are not implemented;
-  and
+Sender avatars use an account-owned Zulip adapter over Appkit's resource
+acquisition and disk cache: rows retain stable initials geometry while loading,
+credentials are sent only to same-origin realm URLs, and completion invalidates
+only sender-dependent rows.  Remaining rich-media limitations:
+
+- inline images and embeds use safe link placeholders rather than in-buffer
+  image acquisition;
+- spoiler content remains visible until per-view reveal state is implemented;
+- tables and unsupported provider blocks use semantic text fallbacks;
+- uploads and attachment previews are not implemented; and
 - realm/custom emoji catalogs and image-backed reaction rendering are not
   implemented.  Completion currently covers Unicode emoji only.
 
-These are implementation gaps, not claims about what Appkit itself can do.
+These are client adapter gaps, not claims about what Appkit itself can do.
 
 ## Development
 

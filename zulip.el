@@ -1,7 +1,7 @@
 ;;; zulip.el --- Appkit-based Zulip client -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (appkit "0.2.19") (plz "0.8") (transient "0.7"))
+;; Package-Requires: ((emacs "29.1") (appkit "0.2.20") (plz "0.8") (transient "0.7"))
 ;; Keywords: comm
 ;; URL: https://github.com/0WD0/emacs-zulip
 
@@ -10,9 +10,10 @@
 ;; A multi-account Zulip client built on Appkit's lifecycle, owned views,
 ;; invalidation, timeline, exact history, composer, completion, layout, and
 ;; mode-line primitives.  Zulip-owned modules provide authentication, REST and
-;; event transport, canonical domain state, narrows, safe HTML rendering, and
+;; event transport, canonical domain state, narrows, a server-HTML direct
+;; adapter into Appkit semantic markup, native provider-object rendering, and
 ;; an account-owned adapter for Appkit's progressive avatar cache.  Attachment,
-;; embedded-media, upload, and realm-emoji adapters are not implemented yet.
+;; upload, and realm-emoji media acquisition remain future adapters.
 
 ;;; Code:
 

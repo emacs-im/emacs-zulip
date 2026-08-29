@@ -537,9 +537,10 @@
               (should bold-position)
               (should link-position)
               (should (get-text-property (1- bold-position) 'face))
-              (should (equal
-                       (get-text-property (1- link-position) 'shr-url)
-                       "https://example.com"))
+              (should
+               (functionp
+                (get-text-property
+                 (1- link-position) appkit-ui-action-property)))
               (should (equal
                        (get-text-property
                         (1- link-position) zulip-feed--anchor-property)
@@ -1111,6 +1112,33 @@
           (should (get-text-property
                    (appkit-chat-timeline-key-position "11")
                    zulip-feed--anchor-property)))))))
+
+(ert-deftest zulip-feed-compact-timestamp-is-right-aligned ()
+  (zulip-feed-test--with-account account
+    (with-temp-buffer
+      (setq-local zulip-feed--account account
+                  zulip-feed--narrow (zulip-narrow-all)
+                  zulip-feed--fill-column 80)
+      (let ((zulip-show-avatar-images nil)
+            (row
+             (appkit-chat-timeline-row-create
+              :key "20"
+              :payload (zulip-feed-test--message "20" "compact body")
+              :context '(:compact t))))
+        (zulip-feed--row-printer row)
+        (goto-char (point-min))
+        (re-search-forward "\\b[0-9][0-9]:[0-9][0-9]\\b")
+        (let* ((timestamp-start (match-beginning 0))
+               (alignment
+                (get-text-property (1- timestamp-start) 'display)))
+          (should (> timestamp-start (line-beginning-position)))
+          (should (equal (car-safe alignment) 'space))
+          (should (memq :align-to alignment))
+          (should
+           (string-match-p
+            "compact body"
+            (buffer-substring-no-properties
+             (line-beginning-position) timestamp-start))))))))
 
 (ert-deftest zulip-feed-uses-appkit-history-autoload-gates ()
   (zulip-feed-test--with-account account
