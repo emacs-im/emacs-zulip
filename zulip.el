@@ -32,13 +32,11 @@
 
 ;;;###autoload
 (defun zulip-connect (server email api-key)
-  "Connect to a Zulip SERVER as EMAIL using API-KEY.
+  "Connect to a Zulip SERVER as EMAIL using explicit API-KEY.
 
-Return the account immediately; registration continues asynchronously."
-  (interactive
-   (list (read-string "Zulip server: " zulip-default-server)
-         (read-string "Zulip email: " zulip-default-email)
-         (read-passwd "Zulip API key: ")))
+API-KEY is programmatic input for integrations; interactive entry points use
+auth-source.  Return the account immediately while registration continues
+asynchronously."
   ;; Runtime creation validates credentials for both first connect and
   ;; reconnect.  A live account ignores the fresh initializer and preserves
   ;; canonical state/views until the register epoch atomically replaces them.
@@ -50,41 +48,46 @@ Return the account immediately; registration continues asynchronously."
     account))
 
 (defun zulip--connect-or-reuse (server email api-key)
-  "Return the live account for SERVER and EMAIL, connecting with API-KEY."
+  "Return the live account for SERVER and EMAIL.
+
+When API-KEY is nil, resolve it from auth-source only if a new connection is
+required."
   (let* ((server (or server
-                     (read-string "Zulip server: " zulip-default-server)))
+                     (read-string "Zulip HTTPS server: "
+                                  zulip-default-server)))
          (email (or email
                     (read-string "Zulip email: " zulip-default-email)))
          (account (zulip-runtime-account server email)))
-    (unless account
-      (setq account
-            (zulip-connect
-             server email (or api-key (read-passwd "Zulip API key: ")))))
-    account))
+    (or account
+        (if api-key
+            (zulip-connect server email api-key)
+          (let ((resolved (zulip-auth-api-key server email)))
+            (unwind-protect
+                (zulip-connect server email resolved)
+              (clear-string resolved)))))))
 
 (defun zulip--connect-default ()
-  "Connect the default account selected from `zulip-rc-file' or prompts.
+  "Connect the selected configured account through auth-source.
 
-A single complete zuliprc profile is used without an account-selection prompt.
-When the configured file has no complete profiles, retain the manual connection
-flow used by `zulip--connect-or-reuse'."
-  (if-let* ((profile
-             (zulip-auth-select-profile (zulip-auth-read-profiles))))
+When `zulip-accounts' is empty, prompt for the HTTPS server and email, then
+resolve that exact target through auth-source."
+  (if-let* ((target
+             (zulip-auth-select-target
+              (zulip-auth-configured-targets))))
       (zulip--connect-or-reuse
-       (zulip-auth-profile-server profile)
-       (zulip-auth-profile-email profile)
-       (zulip-auth-profile-api-key profile))
+       (zulip-auth-target-server target)
+       (zulip-auth-target-email target)
+       nil)
     (zulip--connect-or-reuse nil nil nil)))
 
 ;;;###autoload
 (defun zulip (&optional server email api-key)
   "Connect to Zulip and open the account navigator.
 
-Without explicit credentials, prefer complete accounts discovered in
-`zulip-rc-file': use one account directly or select among several.  If no
-complete file account is available, prompt for SERVER, EMAIL, and API-KEY.
-Supplying any explicit credential retains the manual connection behavior.  The
-root opens immediately while registration continues asynchronously."
+Without explicit arguments, select a non-secret target from `zulip-accounts'
+and resolve its API key through auth-source.  With no configured targets,
+prompt for SERVER and EMAIL and query auth-source.  Supplying API-KEY is an
+explicit programmatic credential override."
   (interactive)
   (zulip-root-open
    (if (and (null server) (null email) (null api-key))

@@ -100,16 +100,41 @@ Return STATE."
   (run-hook-with-args 'zulip-runtime-change-hook account 'state)
   state)
 
+(defun zulip-runtime--replace-api-key (account api-key)
+  "Give ACCOUNT an owned mutable copy of API-KEY.
+
+Any previous account-owned copy is erased before it is released."
+  (unless (and (stringp api-key)
+               (not (string-empty-p api-key))
+               (not (string-match-p "[\r\n]" api-key)))
+    (error "Zulip API key must be nonempty and single-line"))
+  (let ((replacement (copy-sequence api-key))
+        (previous (zulip-account-api-key account)))
+    (when (stringp previous)
+      (clear-string previous))
+    (setf (zulip-account-api-key account) replacement)
+    replacement))
+
+(defun zulip-runtime--clear-api-key (account)
+  "Erase and release ACCOUNT's owned API key."
+  (when-let* ((api-key (zulip-account-api-key account)))
+    (when (stringp api-key)
+      (clear-string api-key))
+    (setf (zulip-account-api-key account) nil)))
+
 (defun zulip-runtime--shutdown (app)
   "Release the Zulip account transported by APP."
   (let ((account (appkit-app-transport app)))
     (when (zulip-account-p account)
-      (when (fboundp 'zulip-events-stop)
-        (zulip-events-stop account))
-      (setf (zulip-account-connected-p account) nil
-            (zulip-account-app account) nil)
-      (remhash (zulip-account-id account) zulip-runtime--accounts)
-      (run-hook-with-args 'zulip-runtime-change-hook account 'removed))))
+      (unwind-protect
+          (when (fboundp 'zulip-events-stop)
+            (zulip-events-stop account))
+        (zulip-runtime--clear-api-key account)
+        (setf (zulip-account-connected-p account) nil
+              (zulip-account-app account) nil)
+        (remhash (zulip-account-id account) zulip-runtime--accounts)
+        (run-hook-with-args
+         'zulip-runtime-change-hook account 'removed)))))
 
 (appkit-define-app-kind zulip
   :shutdown #'zulip-runtime--shutdown)
@@ -122,8 +147,10 @@ initializes a new account; a live account keeps its canonical state and views
 when credentials are refreshed."
   (unless (and (stringp email) (not (string-empty-p (string-trim email))))
     (error "Zulip email must not be empty"))
-  (unless (and (stringp api-key) (not (string-empty-p api-key)))
-    (error "Zulip API key must not be empty"))
+  (unless (and (stringp api-key)
+               (not (string-empty-p api-key))
+               (not (string-match-p "[\r\n]" api-key)))
+    (error "Zulip API key must be nonempty and single-line"))
   (let* ((server (zulip-runtime-normalize-server server))
          (email (string-trim email))
          (id (zulip-runtime-account-id server email))
@@ -131,25 +158,36 @@ when credentials are refreshed."
     (if (and (zulip-account-p account)
              (appkit-app-live-p (zulip-account-app account)))
         (progn
-          (setf (zulip-account-api-key account) api-key)
+          (zulip-runtime--replace-api-key account api-key)
           account)
       (setq account
             (zulip-account--create
              :id id
              :server server
              :email email
-             :api-key api-key
              :state nil
              :longpoll-timeout zulip-event-long-poll-timeout
              :generation 0
              :connected-p nil))
-      (let ((app (appkit-start-app
-                  'zulip :id id :state nil :transport account)))
-        (setf (zulip-account-app account) app)
-        (zulip-runtime-publish-state account state))
-      (puthash id account zulip-runtime--accounts)
-      (run-hook-with-args 'zulip-runtime-change-hook account 'added)
-      account)))
+      (zulip-runtime--replace-api-key account api-key)
+      (let (app)
+        (condition-case error-data
+            (progn
+              (setq app
+                    (appkit-start-app
+                     'zulip :id id :state nil :transport account))
+              (setf (zulip-account-app account) app)
+              (zulip-runtime-publish-state account state)
+              (puthash id account zulip-runtime--accounts)
+              (run-hook-with-args
+               'zulip-runtime-change-hook account 'added)
+              account)
+          (error
+           (when (appkit-app-p app)
+             (ignore-errors (appkit-stop-app app)))
+           (zulip-runtime--clear-api-key account)
+           (remhash id zulip-runtime--accounts)
+           (signal (car error-data) (cdr error-data))))))))
 
 (defun zulip-runtime-stop-account (account)
   "Stop ACCOUNT and all Appkit-owned resources."
@@ -162,6 +200,7 @@ when credentials are refreshed."
     (let ((app (zulip-account-app account)))
       (if (appkit-app-p app)
           (appkit-stop-app app)
+        (zulip-runtime--clear-api-key account)
         (remhash (zulip-account-id account) zulip-runtime--accounts)))
     t))
 
