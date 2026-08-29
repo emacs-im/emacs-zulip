@@ -23,8 +23,9 @@ The package currently provides a complete text-message vertical slice:
   reaction chips, and an inline star;
 - observable auto-read, explicit read/unread actions, starring, reactions,
   editing, and confirmed deletion;
-- an Appkit composer with input history, structured mentions, Unicode emoji
-  completion, optimistic sends, stable rekeying, and retryable failed rows; and
+- an Appkit composer with Markdown, real Org parsing, plain-text mode,
+  Telega-style prefix selection, pure preview, structured mentions, formatting
+  edits, optimistic sends, stable rekeying, and retryable failed rows; and
 - an optional clickable global mode-line unread/mention indicator.
 
 Zulip message IDs are opaque decimal strings at state and view boundaries.
@@ -34,6 +35,21 @@ authoritative server ID when either the event or HTTP response arrives.  When
 an endpoint such as `/messages/flags` requires JSON integers, the HTTP adapter
 validates those strings and emits their digits directly as numeric JSON tokens;
 it never round-trips an ID through an Emacs number.
+
+## Requirements
+
+emacs-zulip requires Emacs 31.1 and Appkit 0.3.0.  Markdown composition also
+requires the `markdown` and `markdown-inline` Tree-sitter grammars.  Check or
+install Appkit's pinned grammar versions explicitly:
+
+```elisp
+(appkit-markup-markdown-ts-ready-p)
+(appkit-markup-markdown-ts-install-grammars)
+```
+
+The installer is never invoked by account startup, preview, or send.  Markdown
+parsing uses Tree-sitter directly without enabling `markdown-ts-mode`, Font
+Lock, embedded code language modes, or user hooks.
 
 ## Account configuration
 
@@ -154,19 +170,34 @@ navigation and message actions but have no composer.
 
 | Key | Action |
 | --- | --- |
-| `RET` | Send, or complete an `@mention`/`:emoji:` token at point |
+| `RET` | Send with the active codec, or complete an `@mention`/`:emoji:` |
 | `C-u RET` | Insert a newline |
 | `TAB`, `C-M-i` | Complete an `@mention` or Unicode `:emoji:` |
-| `C-c RET`, `C-c C-c` | Send literally, or submit a staged edit |
+| `C-c RET`, `C-c C-c` | Send with the active codec, or submit an edit |
+| `C-u C-c C-c` | Parse as the second configured codec for this send |
+| `C-u C-u C-c C-c` | Parse as the third configured codec for this send |
+| `C-c C-v` | Open a non-interactive semantic preview; prefixes select codecs |
+| `C-c C-e` | Apply codec-aware formatting to point or the active region |
+| `C-c C-m` | Select the persistent active source codec |
 | `M-p`, `M-n` | Browse composer input history |
 | `C-c '` | Move point to the composer |
-| `C-c C-k` | Cancel an edit and restore the previous draft |
+| `C-c C-k` | Cancel an edit and restore its draft and active codec |
 | `C-c C-a` | Open the message-action transient |
 
-Mention completion inserts a human-readable, atomic `@Name` object.  Only at
-send time is it serialized to Zulip's stable ID-qualified mention syntax.
-Entering an edit snapshots the current rich draft; cancelling or completing
-the edit restores that draft, including structured mention properties.
+`zulip-compose-codecs` defaults to `(markdown org plain)`.  Selection follows
+Telega's universal-prefix ordering.  Markdown and Org source are parsed into
+one immutable Appkit Document; the same capture drives preview, optimistic
+semantic display, and canonical Zulip-compatible Markdown output.  Markdown
+uses Appkit's pinned block and inline Tree-sitter adapters.  Org uses Emacs's
+built-in `org-element` without enabling Org mode, Babel, Font Lock, or user
+hooks.  Unsupported conversion, such as Org underline to Markdown, is rejected
+instead of silently flattened.
+
+Mention completion inserts a human-readable, atomic `@Name` object.  At output
+time its semantic object prints Zulip's stable ID-qualified mention syntax.
+Entering an edit switches its server-supplied raw source to Markdown and
+snapshots the current rich draft; cancelling or completing restores both that
+draft and its prior active codec.
 
 Sends first insert an optimistic `local-*` row.  An event and its HTTP response
 may arrive in either order; promotion is idempotent.  A failed row remains in
@@ -191,14 +222,14 @@ mention counts are clickable shortcuts into the account navigator.
 
 ## Current limitations
 
-The Appkit 0.2.20 lifecycle, semantic markup, native UI, view ownership,
-sectioned directory, timeline, history, chat buffer, completion, responsive
-layout, mode-line, and avatar infrastructure are integrated.  Zulip's
-authoritative server-rendered HTML is parsed with libxml into Appkit Documents;
-message buffers do not use SHR.  User/group mentions, channel/topic/message
-links, timestamps, spoilers, emoji, media, and unsupported provider structures
-remain typed Zulip objects with safe visible fallbacks.  Links and Zulip
-navigation become native Appkit actions.
+The Appkit 0.3.0 lifecycle, semantic markup, native UI, codec registry,
+source-backed compose capture, view ownership, sectioned directory, timeline,
+history, chat buffer, completion, responsive layout, mode-line, and avatar
+infrastructure are integrated.  Zulip's authoritative server-rendered HTML is
+parsed with libxml into Appkit Documents; message buffers do not use SHR.
+User/group mentions, channel/topic/message links, timestamps, spoilers, emoji,
+media, and unsupported provider structures remain typed Zulip objects with safe
+visible fallbacks.  Links and Zulip navigation become native Appkit actions.
 
 Sender avatars use an account-owned Zulip adapter over Appkit's resource
 acquisition and disk cache: rows retain stable initials geometry while loading,

@@ -486,7 +486,7 @@
                  (server-id "90071992547409931235")
                  (local-node (appkit-chat-timeline-node local-id)))
             (should (string-match-p
-                     (regexp-quote "**bold** [link](https://example.com)")
+                     (regexp-quote "bold link")
                      (buffer-string)))
             ;; The HTTP response may win the race and promote the optimistic
             ;; object before the richer authoritative event arrives.
@@ -676,11 +676,13 @@
           (should (equal (appkit-chat-timeline-keys)
                          '("90071992547409931234"))))))))
 
-(ert-deftest zulip-feed-send-preserves-markdown-whitespace ()
+(ert-deftest zulip-feed-send-canonicalizes-tree-sitter-block-semantics ()
   (zulip-feed-test--with-account account
     (let* ((narrow (zulip-narrow-topic 7 "client"))
            (buffer (zulip-feed--open-buffer account narrow))
            (content "    indented code\nline with break  \n")
+           (wire-content "```\nindented code\n```\n\nline with break")
+           (local-content "indented code\nline with break")
            sent-content)
       (cl-letf (((symbol-function 'zulip-api-send-message)
                  (lambda (_account _type _to _topic wire-content
@@ -694,15 +696,15 @@
                  (message
                   (zulip-state-message
                    (zulip-account-state account) local-id)))
-            (should (equal sent-content content))
+            (should (equal sent-content wire-content))
             (should (equal (zulip-state-object-get message 'content)
-                           content))
+                           wire-content))
             (should (equal (zulip-state-object-get message 'local-content)
-                           content))
-            (should (string-match-p (regexp-quote content)
+                           local-content))
+            (should (string-match-p (regexp-quote local-content)
                                     (buffer-string)))))))))
 
-(ert-deftest zulip-feed-local-echo-treats-markdown-as-plain-text ()
+(ert-deftest zulip-feed-local-echo-respects-markdown-html-block-semantics ()
   (zulip-feed-test--with-account account
     (let* ((narrow (zulip-narrow-topic 7 "client"))
            (buffer (zulip-feed--open-buffer account narrow))
@@ -714,8 +716,75 @@
           (zulip-feed-render)
           (appkit-chatbuf-input-set-text content)
           (zulip-feed-send-message)
-          (should (string-match-p (regexp-quote content)
-                                  (buffer-string))))))))
+          (should (string-match-p
+                   (regexp-quote
+                    "<script>alert(1)</script> &amp; **bold**")
+                   (buffer-string)))
+          (should-not
+           (string-match-p
+            (regexp-quote "<script>alert(1)</script> &amp; bold")
+            (buffer-string))))))))
+
+(ert-deftest zulip-feed-prefix-selects-org-and-encodes-markdown ()
+  (zulip-feed-test--with-account account
+    (let* ((narrow (zulip-narrow-topic 7 "client"))
+           (buffer (zulip-feed--open-buffer account narrow))
+           sent-content)
+      (cl-letf (((symbol-function 'zulip-api-send-message)
+                 (lambda (_account _type _to _topic content
+                          _callback &rest _options)
+                   (setq sent-content content))))
+        (with-current-buffer buffer
+          (appkit-chat-history-window-establish-empty)
+          (zulip-feed-render)
+          (appkit-chatbuf-input-set-text "*bold* and /italic/")
+          (zulip-feed-send-message '(4))
+          (should (equal sent-content "**bold** and *italic*"))
+          (should (string-match-p "bold and italic" (buffer-string))))))))
+
+(ert-deftest zulip-feed-plain-prefix-escapes-markup-on-wire ()
+  (zulip-feed-test--with-account account
+    (let* ((narrow (zulip-narrow-topic 7 "client"))
+           (buffer (zulip-feed--open-buffer account narrow))
+           sent-content)
+      (cl-letf (((symbol-function 'zulip-api-send-message)
+                 (lambda (_account _type _to _topic content
+                          _callback &rest _options)
+                   (setq sent-content content))))
+        (with-current-buffer buffer
+          (appkit-chat-history-window-establish-empty)
+          (zulip-feed-render)
+          (appkit-chatbuf-input-set-text "**literal**")
+          (zulip-feed-send-message '(16))
+          (should (equal sent-content "\\*\\*literal\\*\\*")))))))
+
+(ert-deftest zulip-feed-compose-preview-is-pure-and-loss-is-rejected ()
+  (zulip-feed-test--with-account account
+    (let* ((narrow (zulip-narrow-topic 7 "client"))
+           (buffer (zulip-feed--open-buffer account narrow))
+           (send-count 0))
+      (cl-letf (((symbol-function 'zulip-api-send-message)
+                 (lambda (&rest _arguments) (cl-incf send-count))))
+        (with-current-buffer buffer
+          (appkit-chat-history-window-establish-empty)
+          (zulip-feed-render)
+          (appkit-chatbuf-input-set-text "*bold*")
+          (let ((preview (zulip-feed-preview-message '(4))))
+            (unwind-protect
+                (with-current-buffer preview
+                  (should (equal (buffer-string) "bold\n"))
+                  (should buffer-read-only))
+              (kill-buffer preview)))
+          (should (= send-count 0))
+          (appkit-chatbuf-input-set-text "_underline_")
+          (let ((preview (zulip-feed-preview-message '(4))))
+            (unwind-protect
+                (with-current-buffer preview
+                  (should (equal (buffer-string) "underline\n")))
+              (kill-buffer preview)))
+          (should-error (zulip-feed-send-message '(4)) :type 'user-error)
+          (should (= send-count 0))
+          (should (equal (appkit-chatbuf-input-state) "_underline_")))))))
 
 (ert-deftest zulip-feed-register-invalidates-old-history-owner ()
   (zulip-feed-test--with-account account
@@ -1659,6 +1728,7 @@
                  '(:kind zulip-mention :user-id "42" :full-name "Ada"
                    :wire "@**Ada|42**"))
                 "later")))
+          (appkit-markup-compose-set-active-codec 'org)
           (appkit-chatbuf-input-set-text draft)
           (goto-char (appkit-chat-timeline-key-position "20"))
           (cl-letf (((symbol-function 'zulip-api-get-message)
@@ -1671,11 +1741,13 @@
               (appkit-sync-invalidations (appkit-current-view))
               (should (equal buffer-undo-list undo-before)))
             (should (equal (appkit-chatbuf-input-string) "raw"))
+            (should (eq appkit-markup-compose-active-codec 'markdown))
             (zulip-feed-cancel-edit)
             (should (equal (appkit-chatbuf-input-string) "raw"))
             (let ((undo-before buffer-undo-list))
               (appkit-sync-invalidations (appkit-current-view))
               (should (equal buffer-undo-list undo-before)))
+            (should (eq appkit-markup-compose-active-codec 'org))
             (let* ((restored (appkit-chatbuf-input-string))
                    (object (get-text-property
                             0 appkit-chatbuf-input-object-property restored)))

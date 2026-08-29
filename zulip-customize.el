@@ -49,6 +49,20 @@ variable."
   :group 'zulip)
 
 
+(defcustom zulip-compose-codecs '(markdown org plain)
+  "Ordered source codecs available to Zulip composers.
+
+The first codec is active by default.  `C-u' before send or preview chooses the
+second codec, `C-u C-u' chooses the third, following Telega's markup selection
+interaction.  Every selected source codec is converted through an Appkit
+Document to canonical Zulip-compatible Markdown before transport."
+  :type
+  '(repeat
+    (choice (const :tag "Markdown" markdown)
+            (const :tag "Org" org)
+            (const :tag "Plain text" plain)))
+  :group 'zulip)
+
 (defcustom zulip-event-long-poll-timeout 90
   "Seconds an event queue long-poll may wait before timing out."
   :type 'integer

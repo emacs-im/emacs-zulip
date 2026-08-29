@@ -15,6 +15,7 @@
 (require 'appkit-chat-completion)
 (require 'appkit-chat-emoji)
 (require 'appkit-chatbuf)
+(require 'appkit-markup)
 (require 'zulip-runtime)
 (require 'zulip-state)
 
@@ -177,6 +178,16 @@ ID-qualified mention syntax on the wire."
           (user-error "Unsupported Zulip composer object: %S"
                       (plist-get object :kind))))))
     (apply #'concat (nreverse pieces))))
+
+(defun zulip-completion-markup-object-printer (node)
+  "Return exact Zulip Markdown for semantic composer object NODE.
+
+Return nil for non-Zulip objects so Appkit retains visible fallback and reports
+semantic loss."
+  (when (appkit-markup-object-p node)
+    (let ((object (appkit-markup-object-value node)))
+      (when (zulip-completion--mention-object-p object)
+        (substring-no-properties (plist-get object :wire))))))
 
 (defun zulip-completion--build-mention-candidates (state)
   "Build sorted active-user mention candidates from STATE."
