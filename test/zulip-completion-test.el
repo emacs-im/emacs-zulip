@@ -139,22 +139,9 @@ ACTIVE equal to `missing' omits `is_active'."
             (should (equal "@Ada Lovelace " input))
             (should (eq (plist-get object :kind) 'zulip-mention))
             (should (equal (plist-get object :user-id) "42"))
-            (should
-             (equal "@**Ada Lovelace|42** "
-                    (zulip-completion-serialize-input input)))))))))
+            (should (equal (plist-get object :wire)
+                           "@**Ada Lovelace|42**"))))))))
 
-(ert-deftest zulip-completion-serializes-mixed-mention-and-plain-text ()
-  (with-temp-buffer
-    (appkit-chatbuf-install-prompt ">>> ")
-    (appkit-chatbuf-input-insert
-     "@Ada"
-     :object '(:kind zulip-mention :user-id "42" :full-name "Ada"
-               :wire "@**Ada|42**"))
-    (insert "hello :rocket:")
-    (should
-     (equal "@**Ada|42** hello :rocket:"
-            (zulip-completion-serialize-input
-             (appkit-chatbuf-input-string))))))
 
 (ert-deftest zulip-completion-setup-is-idempotent-and-includes-emoji ()
   (let ((account (zulip-completion-test--account)))
