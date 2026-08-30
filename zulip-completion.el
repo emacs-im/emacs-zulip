@@ -154,30 +154,6 @@ COLLISION-P and SEEN determine its unique visible label."
              (when email
                (list 'help-echo (format "%s · Zulip user %s" email id)))))))
 
-(defun zulip-completion-serialize-input (input)
-  "Serialize Appkit composer INPUT into Zulip Markdown.
-
-Plain text is preserved without text properties.  Structured mention objects
-remain concise `@name' tokens in the buffer but become Zulip's stable
-ID-qualified mention syntax on the wire."
-  (let ((input (or input ""))
-        (property appkit-chatbuf-input-object-property)
-        pieces)
-    (dolist (piece (appkit-chatbuf-split-by-text-property input property))
-      (let ((object (and (not (string-empty-p piece))
-                         (get-text-property 0 property piece))))
-        (cond
-         ((null object)
-          (push (substring-no-properties piece) pieces))
-         ((zulip-completion--mention-object-p object)
-          ;; Appkit's atomic object owns one trailing boundary spacer.  Keep
-          ;; that separator on the wire so following text cannot join the
-          ;; mention token.
-          (push (concat (plist-get object :wire) " ") pieces))
-         (t
-          (user-error "Unsupported Zulip composer object: %S"
-                      (plist-get object :kind))))))
-    (apply #'concat (nreverse pieces))))
 
 (defun zulip-completion-markup-object-printer (node)
   "Return exact Zulip Markdown for semantic composer object NODE.

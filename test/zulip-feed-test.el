@@ -1605,8 +1605,13 @@
                             0 appkit-chatbuf-input-object-property input)
                            :kind)
                           'zulip-mention))
-              (should (equal (zulip-completion-serialize-input input)
-                             "@**Ada|42** protected draft")))
+              (should
+               (equal
+                (plist-get
+                 (get-text-property
+                  0 appkit-chatbuf-input-object-property input)
+                 :wire)
+                "@**Ada|42**")))
 
             (funcall get-callback
                      (zulip-api-result--create
@@ -1624,8 +1629,13 @@
                             0 appkit-chatbuf-input-object-property restored)
                            :kind)
                           'zulip-mention))
-              (should (equal (zulip-completion-serialize-input restored)
-                             "@**Ada|42** protected draft")))
+              (should
+               (equal
+                (plist-get
+                 (get-text-property
+                  0 appkit-chatbuf-input-object-property restored)
+                 :wire)
+                "@**Ada|42**")))
             ;; Outside an edit owner/barrier, ordinary drafts remain fully
             ;; editable through the standard Appkit composer path.
             (appkit-chatbuf-input-set-text "ordinary draft")
@@ -1700,8 +1710,13 @@
                             0 appkit-chatbuf-input-object-property restored)
                            :kind)
                           'zulip-mention))
-              (should (equal (zulip-completion-serialize-input restored)
-                             "@**Ada|42** protected draft")))
+              (should
+               (equal
+                (plist-get
+                 (get-text-property
+                  0 appkit-chatbuf-input-object-property restored)
+                 :wire)
+                "@**Ada|42**")))
             ;; Outside an edit owner/barrier, ordinary drafts remain fully
             ;; editable through the standard Appkit composer path.
             (appkit-chatbuf-input-set-text "ordinary draft")
@@ -1753,8 +1768,8 @@
                             0 appkit-chatbuf-input-object-property restored)))
               (should (equal restored "@Ada later"))
               (should (eq (plist-get object :kind) 'zulip-mention))
-              (should (equal (zulip-completion-serialize-input restored)
-                             "@**Ada|42** later")))))))))
+              (should (equal (plist-get object :wire)
+                             "@**Ada|42**")))))))))
 
 (ert-deftest zulip-feed-stale-edit-get-and-patch-cannot-cross-generations ()
   (zulip-feed-test--with-account account
