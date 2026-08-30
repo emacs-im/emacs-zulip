@@ -48,7 +48,6 @@ variable."
   :type '(choice (const :tag "Prompt every time" nil) string)
   :group 'zulip)
 
-
 (defcustom zulip-compose-codecs '(markdown org plain)
   "Ordered source codecs available to Zulip composers.
 

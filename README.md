@@ -177,7 +177,6 @@ navigation and message actions but have no composer.
 | `C-u C-c C-c` | Parse as the second configured codec for this send |
 | `C-u C-u C-c C-c` | Parse as the third configured codec for this send |
 | `C-c C-v` | Open a non-interactive semantic preview; prefixes select codecs |
-| `C-c C-e` | Apply codec-aware formatting to point or the active region |
 | `C-c C-m` | Select the persistent active source codec |
 | `M-p`, `M-n` | Browse composer input history |
 | `C-c '` | Move point to the composer |
@@ -185,13 +184,14 @@ navigation and message actions but have no composer.
 | `C-c C-a` | Open the message-action transient |
 
 `zulip-compose-codecs` defaults to `(markdown org plain)`.  Selection follows
-Telega's universal-prefix ordering.  Markdown and Org source are parsed into
-one immutable Appkit Document; the same capture drives preview, optimistic
-semantic display, and canonical Zulip-compatible Markdown output.  Markdown
-uses Appkit's pinned block and inline Tree-sitter adapters.  Org uses Emacs's
-built-in `org-element` without enabling Org mode, Babel, Font Lock, or user
-hooks.  Unsupported conversion, such as Org underline to Markdown, is rejected
-instead of silently flattened.
+Telega's universal-prefix ordering.  The composer leaves source text under user
+control and does not inject formatting delimiters.  Markdown and Org source are
+parsed into one immutable Appkit Document; the same capture drives preview,
+optimistic semantic display, and canonical Zulip-compatible Markdown output.
+Markdown uses Appkit's pinned block and inline Tree-sitter adapters.  Org uses
+Emacs's built-in `org-element` without enabling Org mode, Babel, Font Lock, or
+user hooks.  Unsupported conversion, such as Org underline to Markdown, is
+rejected instead of silently flattened.
 
 Mention completion inserts a human-readable, atomic `@Name` object.  At output
 time its semantic object prints Zulip's stable ID-qualified mention syntax.
