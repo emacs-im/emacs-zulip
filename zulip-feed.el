@@ -2696,33 +2696,6 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
   :lighter nil
   :keymap zulip-feed-message-map)
 
-(defun zulip-feed-format-input (operation)
-  "Apply codec-aware formatting OPERATION to composer point or region."
-  (interactive
-   (list
-    (intern
-     (completing-read
-      "Formatting: "
-      '("bold" "italic" "underline" "strike" "code" "link" "quote"
-        "unordered-list" "ordered-list" "heading" "preformatted")
-      nil t))))
-  (unless (zulip-feed--composer-visible-p)
-    (user-error "This feed has no writable composer"))
-  (pcase operation
-    ('bold (appkit-markup-compose-bold))
-    ('italic (appkit-markup-compose-italic))
-    ('underline (appkit-markup-compose-underline))
-    ('strike (appkit-markup-compose-strike))
-    ('code (appkit-markup-compose-code))
-    ('link (call-interactively #'appkit-markup-compose-link))
-    ('quote (appkit-markup-compose-quote))
-    ('unordered-list (appkit-markup-compose-unordered-list))
-    ('ordered-list (appkit-markup-compose-ordered-list))
-    ('heading (call-interactively #'appkit-markup-compose-heading))
-    ('preformatted
-     (call-interactively #'appkit-markup-compose-preformatted))
-    (_ (user-error "Unsupported formatting operation"))))
-
 (defun zulip-feed-select-compose-codec ()
   "Select the visible active source codec for this composer."
   (interactive)
@@ -2742,7 +2715,6 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
   "M-n" #'zulip-feed-draft-next
   "C-c '" #'zulip-feed-edit-draft
   "C-c C-k" #'zulip-feed-cancel-edit
-  "C-c C-e" #'zulip-feed-format-input
   "C-c C-v" #'zulip-feed-preview-message
   "C-c C-m" #'zulip-feed-select-compose-codec
   "C-c C-a" #'zulip-message-transient
