@@ -25,6 +25,7 @@
 (require 'appkit-chat-history)
 (require 'appkit-chat-ins)
 (require 'appkit-chat-timeline)
+(require 'appkit-scroll)
 (require 'appkit-name-color)
 (require 'appkit-ui)
 (require 'appkit-markup)
@@ -107,6 +108,7 @@
 
 (defvar-local zulip-feed--last-read-target-id nil
   "Newest timeline key submitted as an automatic read frontier.")
+(defvar-local zulip-feed--scroll-observer nil)
 
 (defvar-local zulip-feed-timeline-mode nil
   "Non-nil when point-local timeline commands are active.")
@@ -1306,7 +1308,9 @@ timeline flush with the top of the buffer like telega chat buffers."
     (when zulip-feed--history-reload-needed-p
       (setq zulip-feed--history-reload-needed-p nil)
       (unless (appkit-chat-history-loading-p)
-        (zulip-feed-load-latest)))))
+        (zulip-feed-load-latest)))
+    (when (appkit-scroll-observer-p zulip-feed--scroll-observer)
+      (appkit-scroll-observer-check zulip-feed--scroll-observer))))
 
 (defun zulip-feed--event-message-ids (event)
   "Return canonical message IDs directly named by EVENT."
@@ -2627,11 +2631,12 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
        (t (zulip-feed-send-message)))
     (zulip-feed-open-message-context)))
 
-(defun zulip-feed--maybe-auto-load-older ()
-  "Load older history when point approaches the timeline start."
+(defun zulip-feed--maybe-auto-load-older (&optional position)
+  "Load older history when POSITION approaches the timeline start."
   (when (and (not (appkit-chatbuf-point-in-input-p))
              (appkit-chat-history-autoload-older-p
-              (point) (point-min) zulip-history-auto-load-threshold))
+              (or position (point)) (point-min)
+              zulip-history-auto-load-threshold))
     (zulip-feed-load-older)))
 
 (defun zulip-feed--maybe-auto-load-newer (&optional position)
@@ -2652,25 +2657,36 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
              (appkit-chat-history-window-known-p))
     (zulip-feed--mark-read-through position t t)))
 
-(defun zulip-feed--window-scroll (window _display-start)
-  "Observe and auto-page from WINDOW's actual visible timeline edge."
-  (when (and (window-live-p window)
-             (eq (window-buffer window) (current-buffer)))
-    (when-let* ((position
-                 (appkit-chat-timeline-window-visible-end-position window)))
-      ;; Only the selected window is known to have been deliberately observed.
-      ;; Background windows retain unread state, matching telega's observable
-      ;; message semantics instead of treating mere display as consumption.
-      (when (eq window (selected-window))
-        (zulip-feed--manage-read-position position))
-      (zulip-feed--maybe-auto-load-newer position))))
+(defun zulip-feed--install-scroll-observer (view)
+  "Install VIEW's lifecycle-owned history edge observer."
+  (unless (and (appkit-scroll-observer-p zulip-feed--scroll-observer)
+               (appkit-scroll-observer-active-p
+                zulip-feed--scroll-observer)
+               (eq view
+                   (appkit-scroll-observer-owner
+                    zulip-feed--scroll-observer)))
+    (when (appkit-scroll-observer-p zulip-feed--scroll-observer)
+      (appkit-scroll-observer-cancel zulip-feed--scroll-observer))
+    (setq-local
+     zulip-feed--scroll-observer
+     (appkit-scroll-observer-install
+      view
+      :end-boundary-function #'appkit-chat-timeline-footer-start-position
+      :start-function
+      (lambda (_window position _start)
+        (zulip-feed--maybe-auto-load-older position))
+      :end-function
+      (lambda (window position _end)
+        ;; Only the selected window is known to have been deliberately observed.
+        ;; Background windows retain unread state, matching Telega's semantics.
+        (when (eq window (selected-window))
+          (zulip-feed--manage-read-position position))
+        (zulip-feed--maybe-auto-load-newer position))))))
 
 (defun zulip-feed--post-command ()
-  "Maintain Zulip read state and automatic paging."
+  "Maintain Zulip read state after each command."
   (unless (appkit-chatbuf-rendering-p)
-    (zulip-feed--manage-read-position)
-    (zulip-feed--maybe-auto-load-newer)
-    (zulip-feed--maybe-auto-load-older)))
+    (zulip-feed--manage-read-position)))
 
 (defvar-keymap zulip-feed-message-map
   :doc "Single-key command map active over the generated timeline."
@@ -2747,6 +2763,7 @@ path while leaving account-owned optimistic sends in their shared table."
               (list 'zulip-feed-edit-generation))
   (setq-local zulip-feed--edit-operation-owner nil)
   (setq-local zulip-feed--edit-sync-request nil)
+  (setq-local zulip-feed--scroll-observer nil)
   (when (bound-and-true-p appkit-compose-session-mode)
     (appkit-compose-reset))
   (setq-local buffer-read-only nil)
@@ -2769,8 +2786,7 @@ path while leaving account-owned optimistic sends in their shared table."
    :active-codec (car zulip-compose-codecs)
    :object-printer #'zulip-completion-markup-object-printer)
   (appkit-chatbuf-use-timeline-mode #'zulip-feed-timeline-mode)
-  (add-hook 'post-command-hook #'zulip-feed--post-command t t)
-  (add-hook 'window-scroll-functions #'zulip-feed--window-scroll nil t))
+  (add-hook 'post-command-hook #'zulip-feed--post-command t t))
 
 (defun zulip-feed--view-id (account narrow)
   "Return server-qualified Appkit view identity for ACCOUNT and NARROW."
@@ -2815,6 +2831,7 @@ path while leaving account-owned optimistic sends in their shared table."
                          zulip-feed--narrow narrow)
              (zulip-feed--bind-account-tables account)
              (zulip-completion-setup account)
+             (zulip-feed--install-scroll-observer new-view)
              (appkit-chat-history-window-clear)
              (zulip-feed-render)
              (appkit-chatbuf-update-context-mode)))))
@@ -2823,6 +2840,7 @@ path while leaving account-owned optimistic sends in their shared table."
                   zulip-feed--narrow narrow)
       (zulip-feed--bind-account-tables account)
       (zulip-completion-setup account)
+      (zulip-feed--install-scroll-observer view)
       (unless (appkit-chat-timeline-live-p)
         (zulip-feed-render)))
     (appkit-view-buffer view)))

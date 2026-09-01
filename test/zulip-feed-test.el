@@ -1238,6 +1238,27 @@
            (appkit-chat-timeline-footer-start-position)))
         (should (= newer 1))))))
 
+(ert-deftest zulip-feed-owns-scroll-observer-and-rechecks-after-sync ()
+  (zulip-feed-test--with-account account
+    (let* ((narrow (zulip-narrow-channel 7))
+           (buffer (zulip-feed--open-buffer account narrow))
+           checks)
+      (with-current-buffer buffer
+        (let ((observer zulip-feed--scroll-observer))
+          (should (appkit-scroll-observer-p observer))
+          (should (appkit-scroll-observer-active-p observer))
+          (should (eq (appkit-current-view)
+                      (appkit-scroll-observer-owner observer)))
+          (should
+           (eq #'appkit-chat-timeline-footer-start-position
+               (appkit-scroll-observer-end-boundary-function observer)))
+          (cl-letf (((symbol-function 'appkit-scroll-observer-check)
+                     (lambda (candidate &optional _window)
+                       (should (eq candidate observer))
+                       (setq checks (1+ (or checks 0))))))
+            (zulip-feed-render)
+            (should (= 1 checks))))))))
+
 (ert-deftest zulip-feed-history-transport-is-owned-by-view ()
   (zulip-feed-test--with-account account
     (let* ((narrow (zulip-narrow-channel 7))
