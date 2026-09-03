@@ -345,19 +345,18 @@
     (setf (zulip-account-connected-p account) t)
     (let* ((narrow (zulip-narrow-topic 7 "client"))
            (buffer (zulip-feed--open-buffer account narrow))
-           old-view old-owner old-operation canceled replacement)
+           old-view old-owner canceled replacement)
       (with-current-buffer buffer
         (setq old-view (appkit-current-view))
         ;; A live view reuse preserves its controller and draft state; only a
         ;; newly attached replacement is allowed to reset ownership.
         (should (eq buffer (zulip-feed--open-buffer account narrow)))
         (should (eq old-view (appkit-current-view)))
-        (setq old-owner (appkit-chat-history-request-begin 'older)
-              old-operation
-              (appkit-view-operation-begin
-               old-view zulip-feed--history-request-key
-               :cancel-function (lambda (object) (setq canceled object))))
-        (appkit-view-operation-bind old-operation 'stale-history-request)
+        (setq old-owner
+              (appkit-chat-history-request-start old-view 'older))
+        (appkit-register-handle
+         old-owner 'function 'stale-history-request
+         (lambda (object) (setq canceled object)))
         (appkit-chatbuf-input-set-text "stale edit")
         (zulip-feed--set-edit-state "stale-message" t nil "stale draft")
         (setq-local zulip-feed--last-error "stale error"
@@ -369,7 +368,7 @@
         (puthash "stale-unread" t zulip-feed--auto-read-suppressed-ids))
       (appkit-kill-view old-view)
       (should (eq canceled 'stale-history-request))
-      (should-not (appkit-view-operation-current-p old-operation))
+      (should-not (appkit-view-operation-current-p old-owner))
       (should (buffer-live-p buffer))
       (with-current-buffer buffer
         (should-not (appkit-current-view))
@@ -385,14 +384,14 @@
           (should (= history-calls 1))))
       (should (eq replacement buffer))
       (with-current-buffer replacement
-        (let ((new-view (appkit-current-view)))
+        (let* ((new-view (appkit-current-view))
+               (new-owner (appkit-chat-history-request-owner)))
           (should (appkit-view-live-p new-view))
           (should-not (eq new-view old-view))
-          (should
-           (appkit-view-operation-cancel
-            new-view zulip-feed--history-request-key))
+          (should (appkit-view-operation-p new-owner))
+          (should (eq (appkit-view-operation-view new-owner) new-view))
           (should-not (appkit-chat-history-request-current-p old-owner))
-          (should-not (eq (appkit-chat-history-request-owner) old-owner))
+          (should (appkit-chat-history-request-current-p new-owner))
           (should (eq (appkit-chat-history-loading) 'latest))
           (should-not (appkit-chatbuf-aux-active-p))
           (should (equal (appkit-chatbuf-input-string) ""))
@@ -406,7 +405,9 @@
           (should-not zulip-feed--latest-live-keys)
           (should-not zulip-feed--history-reload-needed-p)
           (should (eq zulip-feed--pending
-                      (zulip-feed--account-table account 'pending))))))))
+                      (zulip-feed--account-table account 'pending)))
+          (should (eq new-owner (appkit-chat-history-request-cancel)))
+          (should-not (appkit-chat-history-loading-p)))))))
 
 (ert-deftest zulip-feed-event-first-send-rekeys-once ()
   (zulip-feed-test--with-account account
@@ -1258,7 +1259,7 @@
             (zulip-feed-render)
             (should (= 1 checks))))))))
 
-(ert-deftest zulip-feed-history-transport-is-owned-by-view ()
+(ert-deftest zulip-feed-history-transport-is-owned-by-operation ()
   (zulip-feed-test--with-account account
     (let* ((narrow (zulip-narrow-channel 7))
            (buffer (zulip-feed--open-buffer account narrow))
@@ -1270,11 +1271,16 @@
                    'fake-request)))
         (with-current-buffer buffer
           (zulip-feed-load-latest)
-          (should (eq observed-owner (appkit-current-view)))
+          (should (appkit-view-operation-p observed-owner))
           (should
-           (appkit-view-operation-cancel
-            (appkit-current-view)
-            zulip-feed--history-request-key)))))))
+           (eq (appkit-view-operation-view observed-owner)
+               (appkit-current-view)))
+          (should
+           (eq observed-owner
+               (appkit-chat-history-request-owner)))
+          (should
+           (eq observed-owner
+               (appkit-chat-history-request-cancel))))))))
 
 (ert-deftest zulip-feed-uses-appkit-chatbuf-completion-and-history-adapters ()
   (zulip-feed-test--with-account account

@@ -60,8 +60,6 @@
 
 (autoload 'zulip-message-transient "zulip-transient" nil t)
 
-(defconst zulip-feed--history-request-key 'zulip-feed-history-request
-  "Operation key owning the active history transport.")
 
 (defgroup zulip-feed nil
   "Zulip feed buffers."
@@ -1466,7 +1464,6 @@ transitions and focused reducer tests."
                       (eq (appkit-view-mode view) 'zulip-feed-mode))
              (appkit-with-live-view view
                (appkit-chat-history-request-cancel)
-               (zulip-feed--cancel-history-transport view)
                (appkit-chat-history-window-clear)
                (when-let* ((pending
                             (seq-filter
@@ -1600,33 +1597,24 @@ transitions and focused reducer tests."
       (appkit-chat-history-older-loaded-set t))
     messages))
 
-(defun zulip-feed--history-operation-current-p (view owner operation)
-  "Return non-nil when OWNER and OPERATION own history in VIEW."
-  (and (appkit-view-live-p view)
-       (appkit-view-operation-current-p operation)
-       (with-current-buffer (appkit-view-buffer view)
-         (appkit-chat-history-request-current-p owner))))
 
 (defun zulip-feed--history-finished
-    (view owner operation kind previous-first result)
-  "Finish VIEW request OWNER and OPERATION of KIND using RESULT.
+    (view owner kind previous-first result)
+  "Finish VIEW history OWNER of KIND using RESULT.
 PREVIOUS-FIRST is the history window's older edge before the request."
   (appkit-with-live-view view
-    (when (zulip-feed--history-operation-current-p view owner operation)
-      (appkit-view-operation-finish operation)
+    (when (appkit-chat-history-request-end owner)
       (let ((old-state (zulip-feed--account-state))
             messages)
-        (unwind-protect
-            (if (zulip-feed--result-ok-p result)
-                (progn
-                  (setq zulip-feed--last-error nil)
-                  (setq messages
-                        (zulip-feed--history-succeeded
-                         kind previous-first
-                         (zulip-feed--result-data result))))
-              (setq zulip-feed--last-error
-                    (zulip-feed--result-message result)))
-          (appkit-chat-history-request-end owner))
+        (if (zulip-feed--result-ok-p result)
+            (progn
+              (setq zulip-feed--last-error nil)
+              (setq messages
+                    (zulip-feed--history-succeeded
+                     kind previous-first
+                     (zulip-feed--result-data result))))
+          (setq zulip-feed--last-error
+                (zulip-feed--result-message result)))
         ;; Generated content has exactly one mutation entrance: the Appkit
         ;; view sync function.  HTTP completion only records state/events and
         ;; requests one coalesced projection; even a synchronous transport mock
@@ -1644,12 +1632,6 @@ PREVIOUS-FIRST is the history window's older edge before the request."
         ;; with the event-driven request above when both are present.
         (appkit-request-sync view :parts '(timeline frame))))))
 
-(defun zulip-feed--cancel-history-transport (&optional view)
-  "Cancel VIEW's in-flight history transport, if any."
-  (let ((view (or view (appkit-current-view))))
-    (when (appkit-view-p view)
-      (appkit-view-operation-cancel
-       view zulip-feed--history-request-key))))
 
 (defun zulip-feed--load-history (kind anchor before after)
   "Load history KIND around ANCHOR with BEFORE and AFTER limits."
@@ -1660,35 +1642,21 @@ PREVIOUS-FIRST is the history window's older edge before the request."
   (when (eq kind 'latest)
     (setq zulip-feed--latest-live-keys nil))
   (let* ((view (appkit-current-view))
-         (owner (appkit-chat-history-request-begin kind))
-         (operation
-          (appkit-view-operation-begin
-           view zulip-feed--history-request-key
-           :cancel-function #'zulip-http-cancel-request))
-         (previous-first (appkit-chat-history-window-first-key))
-         request)
+         (owner (appkit-chat-history-request-start view kind))
+         (previous-first (appkit-chat-history-window-first-key)))
     ;; Beginning a request changes passive frame state (the loading delimiter
     ;; and, for partial windows, composer availability).  Even when this load
     ;; originates in a register callback, generated content is only mutated by
     ;; the view's Appkit synchronization transaction.
     (appkit-request-sync view :parts '(frame composer))
-    (setq request
-          (zulip-api-get-messages
-           zulip-feed--account
-           (zulip-narrow-api-json zulip-feed--narrow)
-           anchor before after
-           (lambda (result)
-             (zulip-feed--history-finished
-              view owner operation kind previous-first result))
-           :owner view))
-    (appkit-view-operation-bind operation request)
-    (when (and (null request)
-               (zulip-feed--history-operation-current-p
-                view owner operation))
-      (appkit-view-operation-finish operation)
-      (appkit-chat-history-request-end owner)
-      (setq zulip-feed--last-error "Zulip history request did not start")
-      (appkit-request-sync view :parts '(timeline frame)))
+    (zulip-api-get-messages
+     zulip-feed--account
+     (zulip-narrow-api-json zulip-feed--narrow)
+     anchor before after
+     (lambda (result)
+       (zulip-feed--history-finished
+        view owner kind previous-first result))
+     :owner owner)
     owner))
 
 (defun zulip-feed-load-latest ()
@@ -2875,14 +2843,12 @@ path while leaving account-owned optimistic sends in their shared table."
     (with-current-buffer buffer
       (unless (zulip-account-connected-p account)
         (user-error "Zulip account is not connected"))
-      (let ((view (appkit-current-view)))
-        (appkit-chat-history-request-cancel)
-        (zulip-feed--cancel-history-transport view)
-        (appkit-chat-history-window-clear)
-        (setq-local zulip-feed--pending-jump-id message-id)
-        (zulip-feed--load-history
-         'around message-id before
-         (max 0 (- zulip-history-page-size before 1)))))
+      (appkit-chat-history-request-cancel)
+      (appkit-chat-history-window-clear)
+      (setq-local zulip-feed--pending-jump-id message-id)
+      (zulip-feed--load-history
+       'around message-id before
+       (max 0 (- zulip-history-page-size before 1))))
     (pop-to-buffer buffer)
     (appkit-view-refresh-responsive-geometry)
     buffer))
