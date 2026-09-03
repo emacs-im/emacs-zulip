@@ -61,7 +61,7 @@
 (autoload 'zulip-message-transient "zulip-transient" nil t)
 
 (defconst zulip-feed--history-request-key 'zulip-feed-history-request
-  "View request-table key owning the active history transport.")
+  "Operation key owning the active history transport.")
 
 (defgroup zulip-feed nil
   "Zulip feed buffers."
@@ -892,7 +892,7 @@ server returns authoritative rendered HTML."
 
 When TIMESTAMP is non-nil, append it at the right edge of the first content
 line.  TARGET-WIDTH and LEFT-PREFIX-WIDTH use the same geometry contract as
-`appkit-chat-ins-insert-right-aligned-text'."
+`appkit-chat-ins-insert-right-aligned-text'.  STARRED-P marks saved messages."
   (let ((start (point)))
     (zulip-feed--insert-message-body message)
     (unless (bolp) (insert "\n"))
@@ -1600,13 +1600,20 @@ transitions and focused reducer tests."
       (appkit-chat-history-older-loaded-set t))
     messages))
 
+(defun zulip-feed--history-operation-current-p (view owner operation)
+  "Return non-nil when OWNER and OPERATION own history in VIEW."
+  (and (appkit-view-live-p view)
+       (appkit-view-operation-current-p operation)
+       (with-current-buffer (appkit-view-buffer view)
+         (appkit-chat-history-request-current-p owner))))
+
 (defun zulip-feed--history-finished
-    (view owner kind previous-first result)
-  "Finish VIEW request OWNER of KIND after PREVIOUS-FIRST using RESULT."
+    (view owner operation kind previous-first result)
+  "Finish VIEW request OWNER and OPERATION of KIND using RESULT.
+PREVIOUS-FIRST is the history window's older edge before the request."
   (appkit-with-live-view view
-    (when (appkit-chat-history-request-current-p owner)
-      (remhash zulip-feed--history-request-key
-               (appkit-view-request-table view))
+    (when (zulip-feed--history-operation-current-p view owner operation)
+      (appkit-view-operation-finish operation)
       (let ((old-state (zulip-feed--account-state))
             messages)
         (unwind-protect
@@ -1641,13 +1648,8 @@ transitions and focused reducer tests."
   "Cancel VIEW's in-flight history transport, if any."
   (let ((view (or view (appkit-current-view))))
     (when (appkit-view-p view)
-      (when-let* ((request
-                    (gethash zulip-feed--history-request-key
-                             (appkit-view-request-table view))))
-        (zulip-http-cancel-request request)
-        (remhash zulip-feed--history-request-key
-                 (appkit-view-request-table view))
-        t))))
+      (appkit-view-operation-cancel
+       view zulip-feed--history-request-key))))
 
 (defun zulip-feed--load-history (kind anchor before after)
   "Load history KIND around ANCHOR with BEFORE and AFTER limits."
@@ -1659,8 +1661,11 @@ transitions and focused reducer tests."
     (setq zulip-feed--latest-live-keys nil))
   (let* ((view (appkit-current-view))
          (owner (appkit-chat-history-request-begin kind))
+         (operation
+          (appkit-view-operation-begin
+           view zulip-feed--history-request-key
+           :cancel-function #'zulip-http-cancel-request))
          (previous-first (appkit-chat-history-window-first-key))
-         (callback-ran-p nil)
          request)
     ;; Beginning a request changes passive frame state (the loading delimiter
     ;; and, for partial windows, composer availability).  Even when this load
@@ -1673,13 +1678,17 @@ transitions and focused reducer tests."
            (zulip-narrow-api-json zulip-feed--narrow)
            anchor before after
            (lambda (result)
-             (setq callback-ran-p t)
              (zulip-feed--history-finished
-              view owner kind previous-first result))
+              view owner operation kind previous-first result))
            :owner view))
-    (unless callback-ran-p
-      (puthash zulip-feed--history-request-key request
-               (appkit-view-request-table view)))
+    (appkit-view-operation-bind operation request)
+    (when (and (null request)
+               (zulip-feed--history-operation-current-p
+                view owner operation))
+      (appkit-view-operation-finish operation)
+      (appkit-chat-history-request-end owner)
+      (setq zulip-feed--last-error "Zulip history request did not start")
+      (appkit-request-sync view :parts '(timeline frame)))
     owner))
 
 (defun zulip-feed-load-latest ()
@@ -1915,7 +1924,7 @@ human-readable composer projection used for optimistic display."
            (appkit-markup-compose-output-document output)))))
 
 (defun zulip-feed-preview-message (&optional prefix)
-  "Preview the current composer using PREFIX-selected markup codec."
+  "Preview the current composer using the markup codec selected by PREFIX."
   (interactive "P")
   (unless (zulip-feed--composer-visible-p)
     (user-error "This feed has no writable composer"))
@@ -1933,7 +1942,7 @@ human-readable composer projection used for optimistic display."
     buffer))
 
 (defun zulip-feed-send-message (&optional prefix)
-  "Send composer contents using PREFIX-selected markup, or submit an edit."
+  "Send composer contents with markup selected by PREFIX, or submit an edit."
   (interactive "P")
   (zulip-feed--assert-edit-composer-mutable)
   (if (zulip-feed--edit-message-id)
@@ -2417,7 +2426,7 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
          (message "Zulip: edit cancelled"))))))
 
 (defun zulip-feed-submit-edit (&optional prefix)
-  "Submit the staged edit using PREFIX-selected markup codec."
+  "Submit the staged edit using the markup codec selected by PREFIX."
   (interactive "P")
   (unless (zulip-feed--edit-message-id)
     (user-error "No Zulip message edit is active"))
