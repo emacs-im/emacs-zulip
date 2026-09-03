@@ -1261,30 +1261,28 @@ timeline flush with the top of the buffer like telega chat buffers."
            (remhash id zulip-feed--pending-read-ids)))
        zulip-feed--pending-read-ids))))
 
-(defun zulip-feed--sync-invalidations (view invalidations)
-  "Synchronize VIEW from coalesced Appkit INVALIDATIONS."
-  (let* ((events (appkit-view-pending-events-snapshot view))
-         (rekeys (zulip-feed--apply-queued-events events))
-         (geometry-p
-          (memq 'geometry (appkit-invalidations-parts invalidations)))
-         (force-keys
-          (delete-dups
-           (append
-            (appkit-invalidations-entry-keys invalidations)
-            (and geometry-p
-                 (appkit-chat-timeline-live-p)
-                 (appkit-chat-timeline-keys)))))
-         (changed-resources
-          (appkit-invalidations-resource-keys invalidations)))
+(defun zulip-feed--sync-invalidations (view invalidations events)
+  "Synchronize VIEW from coalesced Appkit INVALIDATIONS and EVENTS."
+  (let* ((rekeys (zulip-feed--apply-queued-events events))
+         (diff
+          (appkit-projection-diff-derive
+           invalidations
+           :existing-keys
+           (and (appkit-chat-timeline-live-p)
+                (appkit-chat-timeline-keys))
+           :reconcile-parts '(timeline)
+           :reconcile rekeys)))
     (zulip-feed--cleanup-pending-read-ids)
     ;; Promotion changes opaque keys before generic missing-edge repair.
     (dolist (mapping rekeys)
       (zulip-feed--rekey-history-edge (car mapping) (cdr mapping)))
     (zulip-feed--reconcile-history-edges)
-    (zulip-feed--sync-timeline
-     :rekeys rekeys
-     :force-keys force-keys
-     :changed-resources changed-resources)
+    (when (appkit-projection-diff-reconcile-p diff)
+      (zulip-feed--sync-timeline
+       :rekeys rekeys
+       :force-keys (appkit-projection-diff-force-keys diff)
+       :changed-resources
+       (appkit-projection-diff-changed-dependencies diff)))
     (when (or events
               (appkit-invalidations-structure-p invalidations)
               (appkit-invalidations-parts invalidations))
@@ -1300,9 +1298,8 @@ timeline flush with the top of the buffer like telega chat buffers."
                 (position (appkit-chat-timeline-key-position target)))
       (setq zulip-feed--pending-jump-id nil)
       (goto-char position))
-    ;; Do not lose a promotion or message event if projection/rendering fails.
-    ;; All bookkeeping above is idempotent, so Appkit can retry the same batch.
-    (appkit-view-acknowledge-events view (length events))
+    ;; Event bookkeeping above is idempotent.  Appkit retains the whole batch
+    ;; when any later projection step fails.
     (when zulip-feed--history-reload-needed-p
       (setq zulip-feed--history-reload-needed-p nil)
       (unless (appkit-chat-history-loading-p)

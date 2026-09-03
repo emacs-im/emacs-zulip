@@ -1006,20 +1006,16 @@ to `zulip-root-visible-topics-per-channel'."
      :force-keys force-keys
      :preserve-position-p t)))
 
-(defun zulip-root--sync-invalidations (view invalidations)
-  "Synchronize VIEW from coalesced INVALIDATIONS."
-  (let* ((events (appkit-view-pending-events-snapshot view))
-         (geometry-p
-          (memq 'geometry (appkit-invalidations-parts invalidations)))
-         (force-keys
-          (delete-dups
-           (append
-            (appkit-invalidations-entry-keys invalidations)
-            (and geometry-p
-                 (mapcar #'zulip-root--entry-key
-                         (zulip-root--project-entries)))))))
-    (zulip-root--sync force-keys)
-    (appkit-view-acknowledge-events view (length events))))
+(defun zulip-root--sync-invalidations (_view invalidations _events)
+  "Synchronize the current root from coalesced INVALIDATIONS."
+  (let* ((entries (zulip-root--project-entries))
+         (diff
+          (appkit-projection-diff-derive
+           invalidations
+           :existing-keys (mapcar #'zulip-root--entry-key entries)
+           :reconcile-parts '(entries))))
+    (when (appkit-projection-diff-reconcile-p diff)
+      (zulip-root--sync (appkit-projection-diff-force-keys diff)))))
 
 (defun zulip-root--invalidate-and-sync (&optional force-keys)
   "Invalidate the current root projection and synchronously reconcile it.
