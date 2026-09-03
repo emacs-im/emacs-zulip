@@ -847,20 +847,23 @@
     (let* ((narrow (zulip-narrow-all))
            (buffer (zulip-feed--open-buffer account narrow)))
       (with-current-buffer buffer
-        (let ((view (appkit-current-view))
-              (invalidations (appkit-invalidations-create)))
+        (let ((view (appkit-current-view)))
           (appkit-view-enqueue-event view '((type . noop)))
+          (appkit-invalidate view :part 'timeline)
           (cl-letf (((symbol-function 'zulip-feed--sync-timeline)
                      (lambda (&rest _arguments)
                        (error "projection failed"))))
-            (should-error
-             (zulip-feed--sync-invalidations view invalidations)))
+            (should-error (appkit-sync-invalidations view)))
           (should (= 1 (length (appkit-view-pending-events view))))
+          (should
+           (memq 'timeline
+                 (appkit-invalidations-parts
+                  (appkit-view-invalidations view))))
           (cl-letf (((symbol-function 'zulip-feed--sync-timeline)
                      (lambda (&rest _arguments) nil))
                     ((symbol-function 'zulip-feed--update-frame)
                      (lambda () nil)))
-            (zulip-feed--sync-invalidations view invalidations))
+            (appkit-sync-invalidations view))
           (should-not (appkit-view-pending-events view)))))))
 
 (ert-deftest zulip-feed-frame-sync-does-not-force-redisplay ()
