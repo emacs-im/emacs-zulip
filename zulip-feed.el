@@ -19,7 +19,7 @@
 (require 'url-util)
 (require 'appkit-core)
 (require 'appkit-compose)
-(require 'appkit-invalidation)
+(require 'appkit-projection)
 (require 'appkit-chat-avatar)
 (require 'appkit-chatbuf)
 (require 'appkit-chat-history)
@@ -59,7 +59,6 @@
 (declare-function zulip-message-transient "zulip-transient" (&rest arguments))
 
 (autoload 'zulip-message-transient "zulip-transient" nil t)
-
 
 (defgroup zulip-feed nil
   "Zulip feed buffers."
@@ -140,6 +139,7 @@
 
 (defun zulip-feed--assert-edit-composer-mutable ()
   "Reject a programmatic composer mutation while an edit owner is active."
+  (zulip-feed--assert-live)
   (when (zulip-feed--edit-composer-busy-p)
     (user-error "The Zulip edit composer is busy")))
 
@@ -197,29 +197,29 @@ composer state.  This function never edits generated buffer content or point."
      (or saved-input "") :reset-history-p t)))
 
 (defun zulip-feed--advance-edit-generation ()
-  "Invalidate prior edit operations and return a fresh generation."
-  (setq zulip-feed--edit-generation (list 'zulip-feed-edit-generation)
-        zulip-feed--edit-operation-owner nil
-        zulip-feed--edit-sync-request nil)
+  "Revoke the previous edit fence before cancelling its actual request."
+  (let ((owner zulip-feed--edit-operation-owner))
+    (setq zulip-feed--edit-generation (list 'zulip-feed-edit-generation)
+          zulip-feed--edit-operation-owner nil
+          zulip-feed--edit-sync-request nil)
+    (when-let* ((handle (plist-get owner :handle)))
+      (zulip-http-cancel-request handle)))
   zulip-feed--edit-generation)
 
-(defun zulip-feed--new-edit-operation-owner
-    (view generation message-id kind)
-  "Install and return an edit operation owner for VIEW and GENERATION.
-
-MESSAGE-ID is the opaque server identity and KIND is either `get' or `patch'."
+(defun zulip-feed--new-edit-operation-owner (view generation message-id kind)
+  "Capture exact Surface, account, App and protocol epoch for one edit."
   (setq zulip-feed--edit-operation-owner
-        (list :view view
-              :generation generation
-              :message-id message-id
-              :kind kind
-              :token (list 'zulip-feed-edit-operation))))
+        (list :view view :generation generation :message-id message-id :kind kind
+              :account zulip-feed--account
+              :app (zulip-account-app zulip-feed--account)
+              :epoch (zulip-account-generation zulip-feed--account)
+              :handle nil :token (list 'zulip-feed-edit-operation))))
 
 (defun zulip-feed--captured-view-current-p (view)
   "Return non-nil when VIEW is this buffer's exact live feed controller."
-  (and (appkit-view-live-p view)
-       (eq (appkit-view-buffer view) (current-buffer))
-       (eq (appkit-current-view) view)
+  (and (appkit-surface-live-p view)
+       (eq (appkit-surface-buffer view) (current-buffer))
+       (eq (appkit-current-surface) view)
        (derived-mode-p 'zulip-feed-mode)))
 
 (defun zulip-feed--edit-generation-current-p (view generation)
@@ -228,12 +228,15 @@ MESSAGE-ID is the opaque server identity and KIND is either `get' or `patch'."
        (eq generation zulip-feed--edit-generation)))
 
 (defun zulip-feed--edit-operation-current-p (view generation owner)
-  "Return non-nil when OWNER still owns GENERATION in exact VIEW."
+  "Return non-nil only while all captured edit authorities still match."
   (let ((state (zulip-feed--edit-state)))
     (and (zulip-feed--edit-generation-current-p view generation)
          (eq owner zulip-feed--edit-operation-owner)
          (eq generation (plist-get state :generation))
-         (eq owner (plist-get state :operation-owner)))))
+         (eq owner (plist-get state :operation-owner))
+         (eq zulip-feed--account (plist-get owner :account))
+         (eq (zulip-account-app zulip-feed--account) (plist-get owner :app))
+         (= (zulip-account-generation zulip-feed--account) (plist-get owner :epoch)))))
 
 (defun zulip-feed--request-edit-sync (view generation &optional action)
   "Materialize edit model state in VIEW for GENERATION, then run ACTION.
@@ -244,8 +247,8 @@ makes both materialization and ACTION inert."
   (when (zulip-feed--edit-generation-current-p view generation)
     (setq zulip-feed--edit-sync-request
           (list :view view :generation generation :action action))
-    (appkit-request-sync
-     view :parts '(frame composer) :position t)))
+    (zulip-runtime--post-surface view
+                                 (appkit-projection-change-create :frame-p t))))
 
 (defun zulip-feed--update-edit-read-only-state ()
   "Reflect the current edit owner/barrier in `buffer-read-only'."
@@ -272,22 +275,10 @@ makes both materialization and ACTION inert."
         (setq zulip-feed--edit-sync-request nil))))
   (zulip-feed--update-edit-read-only-state))
 
-(defun zulip-feed--account-table (account name)
-  "Return ACCOUNT's equal-tested feed registry named NAME."
-  (let* ((app (zulip-account-app account))
-         (store (and (appkit-app-p app) (appkit-app-resource-store app)))
-         (key (list 'zulip-feed name)))
-    (unless store
-      (error "Zulip account has no Appkit resource store"))
-    (or (gethash key store)
-        (let ((table (make-hash-table :test #'equal)))
-          (puthash key table store)
-          table))))
-
 (defun zulip-feed--bind-account-tables (account)
   "Bind current feed buffer registries to tables owned by ACCOUNT."
   (setq-local zulip-feed--pending
-              (zulip-feed--account-table account 'pending)))
+              (zulip-account-pending account)))
 
 (defun zulip-feed--rebase-pending (account state)
   "Return STATE with ACCOUNT's in-flight optimistic messages restored."
@@ -298,7 +289,7 @@ makes both materialization and ACTION inert."
          (setq next
                (zulip-state-upsert-message
                 next message (list narrow-key)))))
-     (zulip-feed--account-table account 'pending))
+     (zulip-account-pending account))
     next))
 
 (defun zulip-feed--field (object key)
@@ -499,7 +490,7 @@ Both Lisp hyphen names and API underscore names are accepted."
   "Refresh and return the current feed's responsive presentation width."
   (setq-local zulip-feed--fill-column
               (max 40
-                   (or (appkit-view-responsive-width 2)
+                   (or (appkit-surface-responsive-width (appkit-current-surface) 2)
                        (and (integerp zulip-feed--fill-column)
                             zulip-feed--fill-column)
                        80))))
@@ -577,10 +568,6 @@ Both Lisp hyphen names and API underscore names are accepted."
   "Return canonical state for the current feed account."
   (and (zulip-account-p zulip-feed--account)
        (zulip-account-state zulip-feed--account)))
-
-(defun zulip-feed--set-account-state (account state)
-  "Install immutable STATE as ACCOUNT's current canonical state."
-  (zulip-runtime-publish-state account state))
 
 (defun zulip-feed--state-entries ()
   "Return ordered state entries for the current narrow."
@@ -1015,10 +1002,15 @@ timeline flush with the top of the buffer like telega chat buffers."
   (let* ((account zulip-feed--account)
          (state (and (zulip-account-p account)
                      (zulip-account-state account)))
-         (status (if (and (zulip-account-p account)
-                          (zulip-account-connected-p account))
-                     "online"
-                   "connecting"))
+         (status (cond
+                  ((and (zulip-account-p account)
+                        (zulip-account-connected-p account))
+                   "online")
+                  ((and (zulip-account-p account)
+                        (appkit-app-live-p (zulip-account-app account))
+                        (zulip-account-events-enabled-p account))
+                   "connecting")
+                  (t "offline")))
          (unread (and (zulip-state-p state)
                       (zulip-state-unread-count state))))
     (format " Zulip  [%s]  %s  ·  %s%s%s"
@@ -1096,16 +1088,24 @@ timeline flush with the top of the buffer like telega chat buffers."
    :after-mutation-function #'appkit-chatbuf-update-context-mode))
 
 (defun zulip-feed--project-rows ()
-  "Project current ordered state entries into Appkit rows."
+  "Project ordered messages, declarative avatar demands and row interests."
   (let* ((messages (zulip-feed--timeline-entries))
-         (first-unread (zulip-feed--first-unread-key messages)))
-    (appkit-chat-timeline-project
-     messages
-     #'zulip-feed--message-key
-     :context-function
-     (lambda (previous message)
-       (zulip-feed--message-context previous message first-unread))
-     :dependencies-function #'zulip-feed--message-dependencies)))
+         (first-unread (zulip-feed--first-unread-key messages))
+         (rows
+          (appkit-chat-timeline-project
+           messages #'zulip-feed--message-key
+           :context-function
+           (lambda (previous message)
+             (zulip-feed--message-context previous message first-unread))
+           :dependencies-function #'zulip-feed--message-dependencies)))
+    (dolist (row rows)
+      (when-let* ((demand (zulip-media-avatar-demand
+                           zulip-feed--account (appkit-projection-row-payload row))))
+        (setf (appkit-projection-row-resource-demands row) (list demand)
+              (appkit-projection-row-dependencies row)
+              (cons (appkit-resource-demand-key demand)
+                    (appkit-projection-row-dependencies row)))))
+    rows))
 
 (defun zulip-feed--rekey-history-edge (old-key new-key)
   "Map exact history edge OLD-KEY to NEW-KEY."
@@ -1187,7 +1187,8 @@ timeline flush with the top of the buffer like telega chat buffers."
      rows
      :force-keys force-keys
      :changed-resources changed-resources
-     :rekeys applicable)))
+     :rekeys applicable)
+    rows))
 
 (defun zulip-feed--update-frame ()
   "Update header, delimiter, and trailing composer in place."
@@ -1199,15 +1200,15 @@ timeline flush with the top of the buffer like telega chat buffers."
    :composer-visible-p (zulip-feed--composer-visible-p)))
 
 (defun zulip-feed-render ()
-  "Invalidate and synchronously render the current feed through Appkit."
+  "Request a committed Generated Surface projection of the current feed."
   (interactive)
-  (let ((view (appkit-current-view)))
-    (unless (appkit-view-live-p view)
-      (error "Zulip feed has no live Appkit view"))
-    (appkit-invalidate view
-                       :structure t
-                       :parts '(timeline frame composer))
-    (appkit-sync-invalidations view)))
+  (let ((surface (appkit-current-surface))
+        (change (appkit-projection-change-create :full-p t :frame-p t)))
+    (unless (appkit-surface-live-p surface)
+      (error "Zulip feed has no live Generated Surface"))
+    (if zulip-runtime--transition-context
+        (zulip-runtime--post-surface surface change)
+      (appkit-surface-send surface change))))
 
 (defun zulip-feed--event-promotion (event)
   "Return EVENT's local-to-server ID mapping, or nil."
@@ -1261,52 +1262,6 @@ timeline flush with the top of the buffer like telega chat buffers."
            (remhash id zulip-feed--pending-read-ids)))
        zulip-feed--pending-read-ids))))
 
-(defun zulip-feed--sync-invalidations (view invalidations events)
-  "Synchronize VIEW from coalesced Appkit INVALIDATIONS and EVENTS."
-  (let* ((rekeys (zulip-feed--apply-queued-events events))
-         (diff
-          (appkit-projection-diff-derive
-           invalidations
-           :existing-keys
-           (and (appkit-chat-timeline-live-p)
-                (appkit-chat-timeline-keys))
-           :reconcile-parts '(timeline)
-           :reconcile rekeys)))
-    (zulip-feed--cleanup-pending-read-ids)
-    ;; Promotion changes opaque keys before generic missing-edge repair.
-    (dolist (mapping rekeys)
-      (zulip-feed--rekey-history-edge (car mapping) (cdr mapping)))
-    (zulip-feed--reconcile-history-edges)
-    (when (appkit-projection-diff-reconcile-p diff)
-      (zulip-feed--sync-timeline
-       :rekeys rekeys
-       :force-keys (appkit-projection-diff-force-keys diff)
-       :changed-resources
-       (appkit-projection-diff-changed-dependencies diff)))
-    (when (or events
-              (appkit-invalidations-structure-p invalidations)
-              (appkit-invalidations-parts invalidations))
-      (zulip-feed--update-frame))
-    ;; Edit HTTP callbacks only settle canonical model state.  Composer text
-    ;; and any requested point movement belong to this exact-view projection
-    ;; transaction and remain guarded by the originating edit generation.
-    (zulip-feed--run-edit-sync-request view)
-    ;; Exact-anchor navigation belongs to the projection transaction.  History
-    ;; callbacks only update the window/domain state and request a coalesced
-    ;; sync, so the target position does not exist until this point.
-    (when-let* ((target zulip-feed--pending-jump-id)
-                (position (appkit-chat-timeline-key-position target)))
-      (setq zulip-feed--pending-jump-id nil)
-      (goto-char position))
-    ;; Event bookkeeping above is idempotent.  Appkit retains the whole batch
-    ;; when any later projection step fails.
-    (when zulip-feed--history-reload-needed-p
-      (setq zulip-feed--history-reload-needed-p nil)
-      (unless (appkit-chat-history-loading-p)
-        (zulip-feed-load-latest)))
-    (when (appkit-scroll-observer-p zulip-feed--scroll-observer)
-      (appkit-scroll-observer-check zulip-feed--scroll-observer))))
-
 (defun zulip-feed--event-message-ids (event)
   "Return canonical message IDs directly named by EVENT."
   (delete-dups
@@ -1350,8 +1305,8 @@ timeline flush with the top of the buffer like telega chat buffers."
 (defun zulip-feed--ids-in-view-state-p (view ids state)
   "Return non-nil when any IDS belongs to VIEW's narrow in STATE."
   (and (zulip-state-p state)
-       (appkit-view-live-p view)
-       (let* ((narrow (appkit-view-state view))
+       (appkit-surface-live-p view)
+       (let* ((narrow (appkit-surface-model view))
               (key (and (zulip-narrow-p narrow)
                         (zulip-narrow-key narrow)))
               (indexed (and (zulip-narrow-p narrow)
@@ -1367,7 +1322,10 @@ Appkit resources affected by it."
   (let ((ids (zulip-feed--event-message-ids event))
         (type (downcase (format "%s" (zulip-feed--field event 'type)))))
     (cond
-     ((equal type "register") t)
+     ((member type '("register" "state" "epoch")) t)
+     ((and (equal type "history")
+           (equal (zulip-feed--field event 'narrow-key)
+                  (zulip-narrow-key (appkit-surface-model view)))) t)
      (ids
       (or (zulip-feed--ids-in-view-state-p view ids old-state)
           (zulip-feed--ids-in-view-state-p view ids new-state)))
@@ -1377,115 +1335,47 @@ Appkit resources affected by it."
      ((member type '("user_topic" "subscription" "stream")) t)
      (t nil))))
 
-(defun zulip-feed--notify-account-views
-    (account event &optional old-state new-state)
-  "Queue relevant EVENT invalidations for ACCOUNT's live feed views."
+(defun zulip-feed--notify-account-views (account event &optional old-state new-state)
+  "Route accepted domain EVENT only to ACCOUNT's dependent feed Surfaces."
   (let ((app (zulip-account-app account)))
     (when (appkit-app-live-p app)
-      (let ((ids (zulip-feed--event-message-ids event))
-            (resources (zulip-feed--event-resource-keys event))
-            (type (downcase (format "%s"
-                                    (zulip-feed--field event 'type)))))
+      (let* ((events (if (equal (zulip-feed--field event 'type) "event_batch")
+                         (zulip-feed--field event 'events) (list event)))
+             (resources (apply #'append (mapcar #'zulip-feed--event-resource-keys events))))
         (maphash
-         (lambda (_id view)
-           (when (and (appkit-view-live-p view)
-                      (eq (appkit-view-mode view) 'zulip-feed-mode)
-                      (zulip-feed--event-relevant-to-view-p
-                       view event old-state new-state resources))
-             (appkit-view-enqueue-event view event)
-             (appkit-request-sync
-              view
-              :structure (member type '("message" "history"
-                                        "local_message" "delete_message"
-                                        "local_message_promoted"
-                                        "local_send_failed"))
-              :parts '(timeline frame)
-              :entries ids
-              :resources resources)))
-         (appkit-app-view-registry app))))))
+         (lambda (_identity entry)
+           (let ((surface (cdr entry)))
+             (when (and (appkit-surface-live-p surface)
+                        (eq (appkit-surface-type surface) zulip-feed--surface-type))
+               (let ((relevant
+                      (seq-filter
+                       (lambda (item)
+                         (zulip-feed--event-relevant-to-view-p
+                          surface item old-state new-state resources))
+                       events)))
+                 (when relevant
+                   (zulip-runtime--post-surface surface (list 'events relevant)))))))
+         (appkit-app-surfaces app))))))
 
-(defun zulip-feed--consume-state-change
-    (account event old-state new-state)
-  "Consume ACCOUNT's already-published EVENT transition.
+(defun zulip-feed--consume-state-change (account event old-state new-state)
+  "Route ACCOUNT's already committed domain EVENT to dependent Surfaces."
+  (dolist (item (if (equal (zulip-feed--field event 'type) "event_batch")
+                    (zulip-feed--field event 'events) (list event)))
+    (when (equal (downcase (format "%s" (zulip-feed--field item 'type)))
+                 "realm_user")
+      (zulip-completion-invalidate-account-cache account))
+    (when-let* ((mapping (zulip-feed--event-promotion item)))
+      (remhash (car mapping) (zulip-account-pending account))))
+  (zulip-feed--notify-account-views account event old-state new-state))
 
-OLD-STATE and NEW-STATE bracket the canonical state transition."
-  (when (equal (downcase (format "%s" (zulip-feed--field event 'type)))
-               "realm_user")
-    (zulip-completion-invalidate-account-cache account))
-  (when-let* ((mapping (zulip-feed--event-promotion event)))
-    (remhash (car mapping)
-             (zulip-feed--account-table account 'pending)))
-  (zulip-feed--notify-account-views
-   account event old-state new-state))
-
-(defun zulip-feed--on-state-changed (change)
-  "Consume one structured `zulip-state-changed' CHANGE descriptor."
-  (when-let* ((account (plist-get change :account))
-              ((zulip-account-p account)))
-    (zulip-feed--consume-state-change
-     account
-     (plist-get change :event)
-     (plist-get change :old-state)
-     (plist-get change :state))))
-
-(defun zulip-feed--on-app-event (account event _old-state new-state)
-  "Publish and fan out one client-originated Zulip EVENT for ACCOUNT.
-
-The protocol event loop uses `zulip-feed--on-state-changed' after publishing
-through the runtime.  This compatibility entry remains for optimistic local
-transitions and focused reducer tests."
-  (when (zulip-account-p account)
-    (let ((old-state (zulip-account-state account)))
-      (when new-state
-        (zulip-feed--set-account-state account new-state))
-      (zulip-feed--consume-state-change
-       account event old-state (or new-state old-state)))))
-
-(defun zulip-feed--on-register (account new-state)
-  "Refresh feed views after ACCOUNT registration installs NEW-STATE."
-  (when (zulip-account-p account)
-    ;; Queue replacement must not erase sends that were accepted locally but
-    ;; have not yet received either their HTTP response or correlated event.
-    (setq new-state (zulip-feed--rebase-pending account new-state))
-    (zulip-feed--set-account-state account new-state)
-    (zulip-feed--notify-account-views
-     account '((type . register)) nil new-state)
-    ;; A register response is a new protocol epoch.  Invalidate both exact
-    ;; history edges and active request owners before loading against the new
-    ;; snapshot; callbacks from the previous queue then become harmless.
-    (let ((app (zulip-account-app account)))
-      (when (appkit-app-live-p app)
-        (maphash
-         (lambda (_id view)
-           (when (and (appkit-view-live-p view)
-                      (eq (appkit-view-mode view) 'zulip-feed-mode))
-             (appkit-with-live-view view
-               (appkit-chat-history-request-cancel)
-               (appkit-chat-history-window-clear)
-               (when-let* ((pending
-                            (seq-filter
-                             (lambda (message)
-                               (zulip-feed--true-p
-                                (zulip-feed--field message 'pending)))
-                             (zulip-feed--state-entries))))
-                 (appkit-chat-history-window-set
-                  (zulip-feed--message-key (car pending)) nil))
-               (zulip-feed-load-initial))))
-         (appkit-app-view-registry app))))))
-
-(defun zulip-feed--ensure-account-subscriptions (account)
-  "Install one Appkit-owned event fanout for ACCOUNT."
-  (let* ((app (zulip-account-app account))
-         (table (appkit-app-request-table app)))
-    (unless (gethash 'zulip-feed-state-subscription table)
-      (puthash 'zulip-feed-state-subscription
-               (appkit-app-on
-                app 'zulip-state-changed #'zulip-feed--on-state-changed)
-               table))
-    (unless (gethash 'zulip-feed-register-subscription table)
-      (puthash 'zulip-feed-register-subscription
-               (appkit-app-on app 'zulip-register #'zulip-feed--on-register)
-               table))))
+(defun zulip-feed--publish-event (account event _old-state new-state)
+  "Commit a local EVENT atomically in its App, or route it after this commit."
+  (cond
+   ((zulip-runtime--account-transition-p account)
+    (zulip-runtime--apply-domain account event new-state))
+   (zulip-runtime--transition-context
+    (zulip-runtime--post-account account (list 'domain event new-state)))
+   (t (appkit-app-send (zulip-account-app account) (list 'domain event new-state)))))
 
 (defun zulip-feed--result-ok-p (result)
   "Return non-nil when API RESULT is successful."
@@ -1508,23 +1398,14 @@ transitions and focused reducer tests."
               "Zulip API request failed")))
 
 (defun zulip-feed--merge-history-messages (messages)
-  "Merge API MESSAGES into the current account state."
-  (let* ((state (zulip-feed--account-state))
-         (key (zulip-narrow-key zulip-feed--narrow))
-         (messages
-          (mapcar
-           (lambda (message)
-             (zulip-state-object-put message 'authoritative t))
-           (zulip-feed--sequence messages)))
-         (next
-          (if (fboundp 'zulip-state-merge-messages)
-              (zulip-state-merge-messages state messages key)
-            (progn
-              (unless (fboundp 'zulip-state-upsert-message)
-                (error "No Zulip state merge function is available"))
-              (dolist (message messages state)
-                (setq state (zulip-state-upsert-message state message)))))))
-    (zulip-feed--set-account-state zulip-feed--account next)
+  "Stage authoritative history MESSAGES for merging against current App state."
+  (let ((messages
+         (mapcar (lambda (message)
+                   (zulip-state-object-put message 'authoritative t))
+                 (zulip-feed--sequence messages))))
+    (zulip-runtime--post-account
+     zulip-feed--account
+     (list 'history messages (zulip-narrow-key zulip-feed--narrow)))
     messages))
 
 (defun zulip-feed--history-succeeded (kind previous-first data)
@@ -1594,67 +1475,39 @@ transitions and focused reducer tests."
       (appkit-chat-history-older-loaded-set t))
     messages))
 
-
-(defun zulip-feed--history-finished
-    (view owner kind previous-first result)
-  "Finish VIEW history OWNER of KIND using RESULT.
-PREVIOUS-FIRST is the history window's older edge before the request."
-  (appkit-with-live-view view
-    (when (appkit-chat-history-request-end owner)
-      (let ((old-state (zulip-feed--account-state))
-            messages)
+(defun zulip-feed--history-finished (surface operation kind previous-first result)
+  "Settle the exact SURFACE history OPERATION using RESULT."
+  (when (appkit-surface-live-p surface)
+    (with-current-buffer (appkit-surface-buffer surface)
+      (when (appkit-chat-history-request-end operation)
         (if (zulip-feed--result-ok-p result)
             (progn
               (setq zulip-feed--last-error nil)
-              (setq messages
-                    (zulip-feed--history-succeeded
-                     kind previous-first
-                     (zulip-feed--result-data result))))
-          (setq zulip-feed--last-error
-                (zulip-feed--result-message result)))
-        ;; Generated content has exactly one mutation entrance: the Appkit
-        ;; view sync function.  HTTP completion only records state/events and
-        ;; requests one coalesced projection; even a synchronous transport mock
-        ;; must not flush the view from inside its callback.
-        (let ((event
-               (list (cons 'type "history")
-                     (cons 'message_ids
-                           (vconcat
-                            (mapcar #'zulip-feed--message-key messages))))))
-          (zulip-feed--notify-account-views
-           zulip-feed--account event old-state
-           (zulip-feed--account-state)))
-        ;; A failed or empty history result may not fan out a relevant event,
-        ;; but the loading/error frame still changed.  This request coalesces
-        ;; with the event-driven request above when both are present.
-        (appkit-request-sync view :parts '(timeline frame))))))
-
+              (zulip-feed--history-succeeded
+               kind previous-first (zulip-feed--result-data result)))
+          (setq zulip-feed--last-error (zulip-feed--result-message result)))
+        (zulip-runtime--post-surface
+         surface (appkit-projection-change-create :frame-p t))))))
 
 (defun zulip-feed--load-history (kind anchor before after)
-  "Load history KIND around ANCHOR with BEFORE and AFTER limits."
-  (unless (fboundp 'zulip-api-get-messages)
-    (error "Zulip API message history is unavailable"))
+  "Load KIND history with a Surface-owned transport and an exact request fence."
   (when (appkit-chat-history-loading-p)
     (user-error "A Zulip history request is already active"))
-  (when (eq kind 'latest)
-    (setq zulip-feed--latest-live-keys nil))
-  (let* ((view (appkit-current-view))
-         (owner (appkit-chat-history-request-start view kind))
-         (previous-first (appkit-chat-history-window-first-key)))
-    ;; Beginning a request changes passive frame state (the loading delimiter
-    ;; and, for partial windows, composer availability).  Even when this load
-    ;; originates in a register callback, generated content is only mutated by
-    ;; the view's Appkit synchronization transaction.
-    (appkit-request-sync view :parts '(frame composer))
-    (zulip-api-get-messages
-     zulip-feed--account
-     (zulip-narrow-api-json zulip-feed--narrow)
-     anchor before after
-     (lambda (result)
-       (zulip-feed--history-finished
-        view owner kind previous-first result))
-     :owner owner)
-    owner))
+  (when (eq kind 'latest) (setq zulip-feed--latest-live-keys nil))
+  (let* ((surface (appkit-current-surface))
+         (operation (appkit-chat-history-request-start surface kind))
+         (previous-first (appkit-chat-history-window-first-key))
+         (handle
+          (zulip-api-get-messages
+           zulip-feed--account (zulip-narrow-api-json zulip-feed--narrow)
+           anchor before after
+           (lambda (result)
+             (zulip-feed--history-finished surface operation kind previous-first result))
+           :owner surface)))
+    (appkit-chat-history-request-bind-handle operation handle)
+    (zulip-runtime--post-surface
+     surface (appkit-projection-change-create :frame-p t))
+    operation))
 
 (defun zulip-feed-load-latest ()
   "Load the newest page for the current feed."
@@ -1805,7 +1658,7 @@ human-readable composer projection used for optimistic display."
 
 (defun zulip-feed--mark-send-failed (account local-id reason)
   "Mark ACCOUNT's pending LOCAL-ID failed with REASON."
-  (let ((pending (zulip-feed--account-table account 'pending)))
+  (let ((pending (zulip-account-pending account)))
     (when-let* ((message (or (gethash local-id pending)
                              (zulip-state-message
                               (zulip-account-state account) local-id))))
@@ -1818,7 +1671,7 @@ human-readable composer projection used for optimistic display."
         ;; in-flight operation, so do not leak it in the account registry.
         (remhash local-id pending)
         (let ((new-state (zulip-state-upsert-message old-state copy)))
-          (zulip-feed--on-app-event
+          (zulip-feed--publish-event
            account
            (list (cons 'type "local_send_failed")
                  (cons 'message copy))
@@ -1828,7 +1681,7 @@ human-readable composer projection used for optimistic display."
 (defun zulip-feed--promote-local-message (account local-id server-id)
   "Promote ACCOUNT's optimistic LOCAL-ID to SERVER-ID exactly once."
   (unless (or (null server-id) (equal local-id server-id))
-    (let ((pending (zulip-feed--account-table account 'pending)))
+    (let ((pending (zulip-account-pending account)))
       (when-let* ((message (gethash local-id pending)))
         (let* ((promoted
                 (zulip-feed--copy-promoted-message
@@ -1839,7 +1692,7 @@ human-readable composer projection used for optimistic display."
           ;; Feed views perform the Appkit row rekey while consuming this
           ;; account event.  The state transition itself does not depend on
           ;; the originating view still being alive.
-          (zulip-feed--on-app-event
+          (zulip-feed--publish-event
            account
            (list (cons 'type "local_message_promoted")
                  (cons 'local_message_id local-id)
@@ -1852,7 +1705,7 @@ human-readable composer projection used for optimistic display."
   (when (and (zulip-account-p account)
              (appkit-app-live-p (zulip-account-app account))
              (gethash local-id
-                      (zulip-feed--account-table account 'pending)))
+                      (zulip-account-pending account)))
     (if (zulip-feed--result-ok-p result)
         (let* ((data (zulip-feed--result-data result))
                (id (zulip-feed--field data 'id))
@@ -1937,7 +1790,7 @@ human-readable composer projection used for optimistic display."
                (next-state
                 (zulip-state-upsert-message
                  state message (list (zulip-narrow-key zulip-feed--narrow))))
-               (view (appkit-current-view)))
+               (view (appkit-current-surface)))
           (puthash local-id message zulip-feed--pending)
           (cond
            ((appkit-chat-history-window-empty-p)
@@ -1947,13 +1800,13 @@ human-readable composer projection used for optimistic display."
            ((null (appkit-chat-history-window-first-key))
             (appkit-chat-history-window-set
              local-id (appkit-chat-history-window-last-key))))
-          (zulip-feed--on-app-event
+          (zulip-feed--publish-event
            account
            (list (cons 'type "local_message")
                  (cons 'message message))
            state next-state)
-          (when (appkit-view-live-p view)
-            (appkit-sync-invalidations view))
+          (when (appkit-surface-live-p view)
+            (zulip-feed-render))
           (appkit-chatbuf-input-history-push input)
           (appkit-chatbuf-input-set-text "")
           (zulip-api-send-message
@@ -1967,7 +1820,6 @@ human-readable composer projection used for optimistic display."
            :local-id local-id
            :queue-id queue-id)
           local-id)))))
-
 
 (defun zulip-feed-message-id-at-point (&optional position)
   "Return the stable message ID at POSITION or point."
@@ -1986,6 +1838,7 @@ human-readable composer projection used for optimistic display."
 
 (defun zulip-feed--server-message-required (&optional message-or-id)
   "Return a canonical server message selected by MESSAGE-OR-ID or point."
+  (zulip-feed--assert-live)
   (let* ((message
           (cond
            ((null message-or-id) (zulip-feed-message-at-point))
@@ -2002,6 +1855,7 @@ human-readable composer projection used for optimistic display."
 
 (defun zulip-feed--failed-local-message-required (&optional message)
   "Return MESSAGE or point message when it is a failed optimistic send."
+  (zulip-feed--assert-live)
   (let* ((message (or message (zulip-feed-message-at-point)))
          (id (and message
                   (ignore-errors (zulip-feed--message-key message)))))
@@ -2021,8 +1875,8 @@ human-readable composer projection used for optimistic display."
          (target (zulip-narrow-send-target zulip-feed--narrow))
          (queue-id (zulip-account-queue-id account))
          (content (zulip-feed--field message 'content))
-         (pending (zulip-feed--account-table account 'pending))
-         (view (appkit-current-view)))
+         (pending (zulip-account-pending account))
+         (view (appkit-current-surface)))
     (unless target
       (user-error "Open the original topic or direct feed to retry this send"))
     (when (appkit-chat-history-window-partial-p)
@@ -2042,12 +1896,12 @@ human-readable composer projection used for optimistic display."
       (let ((new-state
              (zulip-state-upsert-message
               old-state retry (list (zulip-narrow-key zulip-feed--narrow)))))
-        (zulip-feed--on-app-event
+        (zulip-feed--publish-event
          account
          (list (cons 'type "local_message") (cons 'message retry))
          old-state new-state))
-      (when (appkit-view-live-p view)
-        (appkit-sync-invalidations view))
+      (when (appkit-surface-live-p view)
+        (zulip-feed-render))
       ;; Like an ordinary send, the retry belongs to the account app.  Its
       ;; authoritative response may arrive after the origin view is closed.
       (zulip-api-send-message
@@ -2073,14 +1927,16 @@ human-readable composer projection used for optimistic display."
 
 (defun zulip-feed--request-action-frame (view)
   "Request a coalesced refresh of passive action state in Appkit VIEW."
-  (appkit-request-sync view :parts '(frame composer)))
+  (zulip-runtime--post-surface view
+                               (appkit-projection-change-create :frame-p t)))
 
 (defun zulip-feed--record-action-error (view description result)
   "Present failed DESCRIPTION from RESULT in live Appkit VIEW."
   (let ((reason (zulip-feed--result-message result)))
-    (appkit-with-live-view view
-      (setq zulip-feed--last-error reason)
-      (zulip-feed--request-action-frame view))
+    (when (appkit-surface-live-p view)
+      (with-current-buffer (appkit-surface-buffer view)
+        (setq zulip-feed--last-error reason)
+        (zulip-feed--request-action-frame view)))
     (message "Zulip: %s failed: %s" description reason)
     reason))
 
@@ -2093,9 +1949,9 @@ The HTTP process is owned by the current Appkit view.  QUIET suppresses the
 ordinary success message; ON-SUCCESS and ON-FAILURE receive the API result."
   (let* ((ids (delete-dups
                (mapcar #'zulip-state-message-id message-ids)))
-         (view (appkit-current-view)))
+         (view (appkit-current-surface)))
     (unless ids (user-error "No Zulip messages need that flag update"))
-    (unless (appkit-view-live-p view)
+    (unless (appkit-surface-live-p view)
       (user-error "This Zulip feed is no longer live"))
     (zulip-api-update-message-flags
      zulip-feed--account (vconcat ids) operation flag
@@ -2104,13 +1960,14 @@ ordinary success message; ON-SUCCESS and ON-FAILURE receive the API result."
        ;; continuations own feed-local read/edit bookkeeping, so they must run
        ;; in the captured live view rather than whichever buffer happens to be
        ;; current when the response arrives.
-       (appkit-with-live-view view
-         (if (zulip-feed--result-ok-p result)
-             (progn
-               (when on-success (funcall on-success result))
-               (unless quiet (message "Zulip: %s" description)))
-           (when on-failure (funcall on-failure result))
-           (zulip-feed--record-action-error view description result))))
+       (when (appkit-surface-live-p view)
+         (with-current-buffer (appkit-surface-buffer view)
+           (if (zulip-feed--result-ok-p result)
+               (progn
+                 (when on-success (funcall on-success result))
+                 (unless quiet (message "Zulip: %s" description)))
+             (when on-failure (funcall on-failure result))
+             (zulip-feed--record-action-error view description result)))))
      :owner view)))
 
 (defun zulip-feed--timeline-target-newer-p (candidate previous)
@@ -2257,7 +2114,7 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
          (selected-p (and record (plist-get record :selected)))
          (code (and record (plist-get record :code)))
          (type (and record (plist-get record :type)))
-         (view (appkit-current-view))
+         (view (appkit-current-surface))
          (description (if selected-p "removed reaction" "added reaction")))
     (unless (and (stringp name) (not (string-empty-p name)))
       (user-error "Zulip emoji name cannot be empty"))
@@ -2280,72 +2137,74 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
 (defun zulip-feed--edit-fetched
     (view generation owner message-id result)
   "Settle OWNER's GENERATION raw fetch RESULT for MESSAGE-ID in exact VIEW."
-  (appkit-with-live-view view
-    (when (zulip-feed--edit-operation-current-p view generation owner)
-      (let* ((data (and (zulip-feed--result-ok-p result)
-                        (zulip-feed--result-data result)))
-             (wire-message (and data (zulip-feed--field data 'message)))
-             (raw (and data
-                       (or (zulip-feed--field data 'raw-content)
-                           (zulip-feed--field wire-message 'content))))
-             (reason
-              (cond
-               ((not (zulip-feed--result-ok-p result))
-                (zulip-feed--result-message result))
-               ((not (stringp raw))
-                "Zulip did not return raw Markdown for this message"))))
+  (when (appkit-surface-live-p view)
+    (with-current-buffer (appkit-surface-buffer view)
+      (when (zulip-feed--edit-operation-current-p view generation owner)
+        (let* ((data (and (zulip-feed--result-ok-p result)
+                          (zulip-feed--result-data result)))
+               (wire-message (and data (zulip-feed--field data 'message)))
+               (raw (and data
+                         (or (zulip-feed--field data 'raw-content)
+                             (zulip-feed--field wire-message 'content))))
+               (reason
+                (cond
+                 ((not (zulip-feed--result-ok-p result))
+                  (zulip-feed--result-message result))
+                 ((not (stringp raw))
+                  "Zulip did not return raw Markdown for this message"))))
+          (setq zulip-feed--edit-operation-owner nil)
+          (if reason
+              (progn
+                ;; Restore only canonical state here.  The scheduled exact-view
+                ;; sync below owns composer materialization and point.
+                (zulip-feed--finish-edit-and-restore-draft)
+                (setq zulip-feed--last-error reason)
+                (zulip-feed--request-edit-sync
+                 view generation
+                 (lambda ()
+                   (when (zulip-feed--composer-visible-p)
+                     (zulip-feed-edit-draft))
+                   (message "Zulip: fetch message source failed: %s" reason))))
+            (zulip-feed--set-edit-state
+             message-id nil nil nil
+             :generation generation :operation-owner nil)
+            (setq zulip-feed--last-error nil)
+            (unless (eq appkit-markup-compose-active-codec 'markdown)
+              (appkit-markup-compose-set-active-codec 'markdown))
+            (appkit-chatbuf-input-state-set raw :reset-history-p t)
+            (zulip-feed--request-edit-sync
+             view generation
+             (lambda ()
+               (zulip-feed-edit-draft)
+               (message "Zulip: editing message %s" message-id)))))))))
+
+(defun zulip-feed--edit-updated
+    (view generation owner message-id content result)
+  "Settle OWNER's GENERATION PATCH RESULT for MESSAGE-ID and CONTENT in VIEW."
+  (when (appkit-surface-live-p view)
+    (with-current-buffer (appkit-surface-buffer view)
+      (when (zulip-feed--edit-operation-current-p view generation owner)
         (setq zulip-feed--edit-operation-owner nil)
-        (if reason
+        (if (zulip-feed--result-ok-p result)
             (progn
-              ;; Restore only canonical state here.  The scheduled exact-view
-              ;; sync below owns composer materialization and point.
+              (setq zulip-feed--last-error nil)
+              (appkit-chatbuf-input-history-push content)
               (zulip-feed--finish-edit-and-restore-draft)
-              (setq zulip-feed--last-error reason)
               (zulip-feed--request-edit-sync
                view generation
                (lambda ()
                  (when (zulip-feed--composer-visible-p)
                    (zulip-feed-edit-draft))
-                 (message "Zulip: fetch message source failed: %s" reason))))
-          (zulip-feed--set-edit-state
-           message-id nil nil nil
-           :generation generation :operation-owner nil)
-          (setq zulip-feed--last-error nil)
-          (unless (eq appkit-markup-compose-active-codec 'markdown)
-            (appkit-markup-compose-set-active-codec 'markdown))
-          (appkit-chatbuf-input-state-set raw :reset-history-p t)
-          (zulip-feed--request-edit-sync
-           view generation
-           (lambda ()
-             (zulip-feed-edit-draft)
-             (message "Zulip: editing message %s" message-id))))))))
-
-(defun zulip-feed--edit-updated
-    (view generation owner message-id content result)
-  "Settle OWNER's GENERATION PATCH RESULT for MESSAGE-ID and CONTENT in VIEW."
-  (appkit-with-live-view view
-    (when (zulip-feed--edit-operation-current-p view generation owner)
-      (setq zulip-feed--edit-operation-owner nil)
-      (if (zulip-feed--result-ok-p result)
-          (progn
-            (setq zulip-feed--last-error nil)
-            (appkit-chatbuf-input-history-push content)
-            (zulip-feed--finish-edit-and-restore-draft)
+                 (message "Zulip: edited message %s" message-id))))
+          (let ((reason (zulip-feed--result-message result)))
+            (zulip-feed--set-edit-state
+             message-id nil nil nil
+             :generation generation :operation-owner nil)
+            (setq zulip-feed--last-error reason)
             (zulip-feed--request-edit-sync
              view generation
              (lambda ()
-               (when (zulip-feed--composer-visible-p)
-                 (zulip-feed-edit-draft))
-               (message "Zulip: edited message %s" message-id))))
-        (let ((reason (zulip-feed--result-message result)))
-          (zulip-feed--set-edit-state
-           message-id nil nil nil
-           :generation generation :operation-owner nil)
-          (setq zulip-feed--last-error reason)
-          (zulip-feed--request-edit-sync
-           view generation
-           (lambda ()
-             (message "Zulip: edit message failed: %s" reason))))))))
+               (message "Zulip: edit message failed: %s" reason)))))))))
 
 (defun zulip-feed-edit-message (&optional message)
   "Fetch raw Markdown for MESSAGE and stage it in the Appkit composer."
@@ -2354,7 +2213,7 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
     (user-error "Finish or cancel the current Zulip edit first"))
   (let* ((message (zulip-feed--server-message-required message))
          (id (zulip-feed--message-key message))
-         (view (appkit-current-view))
+         (view (appkit-current-surface))
          (generation (zulip-feed--advance-edit-generation))
          (owner (zulip-feed--new-edit-operation-owner
                  view generation id 'get)))
@@ -2366,18 +2225,20 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
     ;; draft state without materializing it yet.  The new generation owns that
     ;; barrier as well as its working frame.
     (zulip-feed--request-edit-sync view generation)
-    (zulip-api-get-message
-     zulip-feed--account id
-     (lambda (result)
-       (zulip-feed--edit-fetched view generation owner id result))
-     :apply-markdown nil :allow-empty-topic-name t :owner view)))
+    (zulip-feed--bind-edit-handle
+     view generation owner
+     (zulip-api-get-message
+      zulip-feed--account id
+      (lambda (result)
+        (zulip-feed--edit-fetched view generation owner id result))
+      :apply-markdown nil :allow-empty-topic-name t :owner view))))
 
 (defun zulip-feed-cancel-edit ()
   "Cancel the current staged message edit and clear its draft."
   (interactive)
   (unless (zulip-feed--edit-message-id)
     (user-error "No Zulip message edit is active"))
-  (let ((view (appkit-current-view)))
+  (let ((view (appkit-current-surface)))
     (setq zulip-feed--last-error nil)
     (zulip-feed--finish-edit-and-restore-draft)
     ;; Advancing after capturing/restoring the old session draft makes every
@@ -2403,7 +2264,7 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
          (message-id (zulip-feed--edit-message-id))
          (snapshot (zulip-feed--compose-snapshot prefix))
          (content (plist-get snapshot :content))
-         (view (appkit-current-view))
+         (view (appkit-current-surface))
          (generation (plist-get state :generation)))
     (unless (eq generation zulip-feed--edit-generation)
       (user-error "This Zulip edit session is no longer current"))
@@ -2415,19 +2276,21 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
        message-id t nil nil
        :generation generation :operation-owner owner)
       (zulip-feed--request-action-frame view)
-      (zulip-api-update-message
-       zulip-feed--account message-id
-       (lambda (result)
-         (zulip-feed--edit-updated
-          view generation owner message-id content result))
-       :content content :owner view))))
+      (zulip-feed--bind-edit-handle
+       view generation owner
+       (zulip-api-update-message
+        zulip-feed--account message-id
+        (lambda (result)
+          (zulip-feed--edit-updated
+           view generation owner message-id content result))
+        :content content :owner view)))))
 
 (defun zulip-feed-delete-message (&optional message)
   "Permanently delete MESSAGE at point after confirmation."
   (interactive)
   (let* ((message (zulip-feed--server-message-required message))
          (id (zulip-feed--message-key message))
-         (view (appkit-current-view)))
+         (view (appkit-current-surface)))
     (when (yes-or-no-p (format "Delete Zulip message %s permanently? " id))
       (zulip-api-delete-message
        zulip-feed--account id
@@ -2592,7 +2455,6 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
         (zulip-feed-edit-draft))
     (user-error (user-error "Not browsing Zulip input history"))))
 
-
 (defun zulip-feed-return-dwim (argument)
   "Open context, complete/send the draft, or insert newline with ARGUMENT."
   (interactive "P")
@@ -2716,11 +2578,11 @@ is nil, prompt for a Zulip emoji name and infer whether it is already ours."
   "C-c C-l" #'zulip-feed-load-latest)
 
 (defun zulip-feed--reset-view-local-state ()
-  "Reset controller state owned by one concrete feed view.
+  "Initialize state owned by one concrete Generated feed Surface.
 
-Appkit can attach a replacement view to an existing same-named buffer without
-re-running its major mode.  Keep all view-local ownership resettable from that
-path while leaving account-owned optimistic sends in their shared table."
+Major mode initialization precedes attachment.  Reopening restores a saved
+editable draft explicitly, never history fences or predecessor capabilities.
+Account-owned optimistic sends remain in their shared domain table."
   (appkit-chatbuf-reset-state)
   (appkit-chat-history-reset-state)
   (setq-local zulip-feed--pending nil)
@@ -2776,48 +2638,47 @@ path while leaving account-owned optimistic sends in their shared table."
           (zulip-narrow-title narrow)))
 
 (defun zulip-feed--open-buffer (account narrow)
-  "Open or reuse ACCOUNT's feed for NARROW and return its buffer."
+  "Open or reuse the stable account-bound Generated feed for NARROW."
   (unless (and (zulip-account-p account)
                (appkit-app-live-p (zulip-account-app account)))
     (error "Zulip feed requires a live account"))
-  (unless (zulip-narrow-p narrow)
-    (error "Invalid Zulip feed narrow: %S" narrow))
-  (zulip-feed--ensure-account-subscriptions account)
+  (unless (zulip-narrow-p narrow) (error "Invalid Zulip narrow: %S" narrow))
   (let* ((app (zulip-account-app account))
-         (view
-          (appkit-open-view
-           :app app
-           :id (zulip-feed--view-id account narrow)
-           :mode 'zulip-feed-mode
-           :buffer-name (zulip-feed--buffer-name account narrow)
-           :state narrow
-           :sync-function #'zulip-feed--sync-invalidations
-           :parts '(frame timeline composer history geometry)
-           :setup
-           (lambda (new-view)
-             (appkit-view-enable-responsive-geometry new-view)
-             ;; `appkit-open-view' initializes a major mode only once per
-             ;; buffer, but SETUP runs for every newly attached view.  A dead
-             ;; predecessor must not lend its history owner, edit request,
-             ;; pending jump, or read frontier to this replacement.
-             (zulip-feed--reset-view-local-state)
-             (setq-local zulip-feed--account account
-                         zulip-feed--narrow narrow)
-             (zulip-feed--bind-account-tables account)
-             (zulip-completion-setup account)
-             (zulip-feed--install-scroll-observer new-view)
-             (appkit-chat-history-window-clear)
-             (zulip-feed-render)
-             (appkit-chatbuf-update-context-mode)))))
-    (with-current-buffer (appkit-view-buffer view)
-      (setq-local zulip-feed--account account
-                  zulip-feed--narrow narrow)
-      (zulip-feed--bind-account-tables account)
-      (zulip-completion-setup account)
-      (zulip-feed--install-scroll-observer view)
-      (unless (appkit-chat-timeline-live-p)
-        (zulip-feed-render)))
-    (appkit-view-buffer view)))
+         (identity (zulip-feed--view-id account narrow))
+         (existing (appkit-app-surface app identity)))
+    (if (appkit-surface-live-p existing)
+        (appkit-surface-buffer existing)
+      (let* ((name (zulip-feed--buffer-name account narrow))
+             (buffer
+              (when-let* ((candidate (get-buffer name)))
+                (with-current-buffer candidate
+                  (when (and (derived-mode-p 'zulip-feed-mode)
+                             (not (appkit-current-surface))
+                             (zulip-account-p zulip-feed--account)
+                             (equal (zulip-account-id zulip-feed--account)
+                                    (zulip-account-id account))
+                             (equal (zulip-narrow-key zulip-feed--narrow)
+                                    (zulip-narrow-key narrow)))
+                    candidate))))
+             (draft (and buffer (with-current-buffer buffer
+                                  (and (derived-mode-p 'zulip-feed-mode)
+                                       (appkit-chatbuf-input-state)))))
+             (codec (and buffer (buffer-local-value
+                                 'appkit-markup-compose-active-codec buffer)))
+             (surface
+              (appkit-open-generated-surface
+               zulip-feed--surface-type :app app :identity identity
+               :input (list account narrow draft codec)
+               :buffer buffer :buffer-name name)))
+        (with-current-buffer (appkit-surface-buffer surface)
+          (zulip-completion-setup account)
+          (zulip-feed--install-scroll-observer surface)
+          (appkit-surface-enable-responsive-geometry
+           surface (lambda (current _width)
+                     (zulip-runtime--post-surface
+                      current (appkit-projection-change-create
+                               :geometry-p t :frame-p t)))))
+        (appkit-surface-buffer surface)))))
 
 (defun zulip-feed-open (account narrow)
   "Open ACCOUNT's server-qualified feed buffer for NARROW."
@@ -2828,7 +2689,7 @@ path while leaving account-owned optimistic sends in their shared table."
                   (appkit-chat-history-loading-p))
         (zulip-feed-load-initial)))
     (pop-to-buffer buffer)
-    (appkit-view-refresh-responsive-geometry)
+    (appkit-surface-refresh-responsive-geometry (appkit-current-surface))
     buffer))
 
 (defun zulip-feed-open-message (account narrow message-id)
@@ -2847,8 +2708,156 @@ path while leaving account-owned optimistic sends in their shared table."
        'around message-id before
        (max 0 (- zulip-history-page-size before 1))))
     (pop-to-buffer buffer)
-    (appkit-view-refresh-responsive-geometry)
+    (appkit-surface-refresh-responsive-geometry (appkit-current-surface))
     buffer))
+
+(defun zulip-feed--surface-init (context input)
+  "Initialize a fresh exact feed Surface from ACCOUNT/NARROW and saved draft."
+  (pcase-let ((`(,account ,narrow ,draft ,codec) input))
+    (setq-local zulip-feed--account account
+                zulip-feed--narrow narrow
+                zulip-runtime--surface-address
+                (appkit-transition-context-owner-address context))
+    (zulip-feed--bind-account-tables account)
+    (when codec (appkit-markup-compose-set-active-codec codec))
+    (when draft (appkit-chatbuf-input-state-set draft :reset-history-p t))
+    (appkit-next :model narrow
+                 :render (appkit-projection-change-create :full-p t :frame-p t))))
+
+(defun zulip-feed--surface-update (context narrow message)
+  "Commit feed state and return closed request and routing commands."
+  (let ((zulip-runtime--transition-context context)
+        zulip-runtime--commands
+        (change appkit-render-none))
+    (pcase message
+      ((pred appkit-projection-change-p) (setq change message))
+      (`(cancel-effect ,key)
+       (push (appkit-command-cancel-effect key) zulip-runtime--commands))
+      (`(start-effect ,effect)
+       (push (appkit-command-start-effect effect) zulip-runtime--commands))
+      (`(response ,callback ,result)
+       (funcall callback result)
+       (setq change (appkit-projection-change-create :frame-p t)))
+      (`(events ,events)
+       (let* ((types (mapcar (lambda (event)
+                               (downcase (format "%s" (zulip-feed--field event 'type))))
+                             events))
+              (registered (member "register" types))
+              (epoch (member "epoch" types))
+              (rekeys (zulip-feed--apply-queued-events events)))
+         (zulip-feed--cleanup-pending-read-ids)
+         (dolist (mapping rekeys)
+           (zulip-feed--rekey-history-edge (car mapping) (cdr mapping)))
+         (when (or registered epoch)
+           (when (zulip-feed--edit-request-p)
+             (zulip-feed--finish-edit-and-restore-draft)
+             (zulip-feed--request-edit-sync
+              (appkit-current-surface) (zulip-feed--advance-edit-generation)))
+           (appkit-chat-history-request-cancel)
+           (clrhash zulip-feed--pending-read-ids)
+           (setq zulip-feed--last-read-target-id nil))
+         (if registered
+             (progn
+               (appkit-chat-history-window-clear)
+               (when-let* ((pending
+                            (seq-filter
+                             (lambda (entry) (zulip-feed--true-p
+                                              (zulip-feed--field entry 'pending)))
+                             (zulip-feed--state-entries))))
+                 (appkit-chat-history-window-set
+                  (zulip-feed--message-key (car pending)) nil))
+               (zulip-feed-load-initial))
+           (zulip-feed--reconcile-history-edges))
+         (setq change
+               (appkit-projection-change-create
+                :full-p t :frame-p t :rekeys rekeys
+                :keys (delete-dups (apply #'append
+                                          (mapcar #'zulip-feed--event-message-ids events)))
+                :resources (delete-dups
+                            (apply #'append
+                                   (mapcar #'zulip-feed--event-resource-keys events))))))))
+    (when zulip-feed--history-reload-needed-p
+      (setq zulip-feed--history-reload-needed-p nil)
+      (unless (appkit-chat-history-loading-p)
+        (zulip-feed-load-latest)))
+    (appkit-next :model narrow :render change
+                 :commands (nreverse zulip-runtime--commands))))
+
+(defun zulip-feed--render-projection (surface _app _narrow change)
+  "Reconcile committed rows and composer without I/O or premature history loss."
+  (let* ((reconcile
+          (or (appkit-projection-change-full-p change)
+              (appkit-projection-change-keys change)
+              (appkit-projection-change-resources change)
+              (appkit-projection-change-rekeys change)
+              (appkit-projection-change-geometry-p change)))
+         (rows
+          (when reconcile
+            (zulip-feed--sync-timeline
+             :rekeys (appkit-projection-change-rekeys change)
+             :force-keys
+             (if (appkit-projection-change-geometry-p change)
+                 (appkit-chat-timeline-keys)
+               (appkit-projection-change-keys change))
+             :changed-resources (appkit-projection-change-resources change)))))
+    (when (or (appkit-projection-change-frame-p change)
+              (appkit-projection-change-full-p change)
+              (appkit-projection-change-geometry-p change))
+      (zulip-feed--update-frame))
+    (zulip-feed--run-edit-sync-request surface)
+    (when-let* ((target zulip-feed--pending-jump-id)
+                (position (appkit-chat-timeline-key-position target)))
+      (setq zulip-feed--pending-jump-id nil)
+      (goto-char position))
+    (when reconcile (appkit-projection--resource-result rows))))
+
+(defun zulip-feed--renderer (_surface)
+  "Create a Generated Renderer backed by the native chat projection engine."
+  (appkit-generated-renderer-create
+   :mount (lambda (_surface _app _model) (zulip-feed--ensure-timeline))
+   :merge #'appkit-projection-change-merge
+   :resource-request (lambda (keys)
+                       (appkit-projection-change-create :resources keys))
+   :render #'zulip-feed--render-projection
+   :recover
+   (lambda (surface app narrow _condition)
+     (setq-local appkit-chat-timeline--state nil)
+     (zulip-feed--ensure-timeline)
+     (zulip-feed--render-projection
+      surface app narrow (appkit-projection-change-create :full-p t :frame-p t)))
+   :unmount #'zulip-feed--unmount))
+
+(defconst zulip-feed--surface-type
+  (appkit-surface-type-create
+   :name 'zulip-feed :mode #'zulip-feed--initialize-mode
+   :init #'zulip-feed--surface-init :update #'zulip-feed--surface-update
+   :renderer-factory #'zulip-feed--renderer))
+
+(defun zulip-feed--bind-edit-handle (view generation owner handle)
+  "Bind HANDLE to OWNER only if its complete edit fence is still current."
+  (if (zulip-feed--edit-operation-current-p view generation owner)
+      (setf (plist-get owner :handle) handle)
+    (when handle (zulip-http-cancel-request handle)))
+  handle)
+
+(defun zulip-feed--assert-live ()
+  "Require the current feed's exact active Surface authority."
+  (unless (and (appkit-surface-live-p (appkit-current-surface))
+               (eq (appkit-surface-app (appkit-current-surface))
+                   (zulip-account-app zulip-feed--account)))
+    (user-error "This Zulip feed is no longer live")))
+
+(defun zulip-feed--unmount (_surface)
+  "Revoke feed operation fences but leave the visible draft editable."
+  (appkit-chat-history-request-cancel)
+  (zulip-feed--advance-edit-generation)
+  (appkit-chatbuf-aux-reset)
+  (setq-local appkit-chat-timeline--state nil
+              buffer-read-only nil))
+
+(defun zulip-feed--initialize-mode ()
+  "Initialize the existing derived feed mode before a replacement attaches."
+  (funcall (if (derived-mode-p 'zulip-feed-mode) major-mode #'zulip-feed-mode)))
 
 (provide 'zulip-feed)
 

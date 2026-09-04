@@ -16,7 +16,7 @@
 (require 'subr-x)
 (require 'appkit-core)
 (require 'appkit-directory)
-(require 'appkit-invalidation)
+(require 'appkit-projection)
 (require 'appkit-task-queue)
 (require 'appkit-ui)
 (require 'appkit-presentation)
@@ -47,22 +47,8 @@
 (defconst zulip-root--icon-slot-width 4
   "Reserved icon width for one navigator activity row.")
 
-(defconst zulip-root--event-subscriptions-key
-  '(zulip-root event-subscriptions)
-  "Resource-store key for one account's root event subscriptions.")
-
-(defconst zulip-root--topic-cache-key
-  '(zulip-root topic-cache)
-  "App resource-store key for account-scoped channel topic metadata.")
-
-(defconst zulip-root--topic-errors-key
-  '(zulip-root topic-errors)
-  "App resource-store key for account-scoped topic hydration errors.")
-
-
 (defvar-local zulip-root--account nil
   "Zulip account owning the current navigator buffer.")
-
 
 (defvar-local zulip-root--fill-column nil
   "Last usable row width measured from a window displaying this root.")
@@ -99,28 +85,13 @@
                     (zulip-account-state (or account zulip-root--account)))))
     (if (zulip-state-p state) state (zulip-state-create))))
 
-(defun zulip-root--resource-table (key &optional account)
-  "Return account-scoped Appkit resource table stored under KEY.
-
-ACCOUNT defaults to the current root account."
-  (let* ((account (or account zulip-root--account))
-         (app (and (zulip-account-p account) (zulip-account-app account))))
-    (unless (appkit-app-live-p app)
-      (error "Zulip root resources require a live account"))
-    (let* ((store (appkit-app-resource-store app))
-           (table (gethash key store)))
-      (unless (hash-table-p table)
-        (setq table (make-hash-table :test #'equal))
-        (puthash key table store))
-      table)))
-
 (defun zulip-root--topic-cache (&optional account)
-  "Return ACCOUNT's channel topic metadata cache."
-  (zulip-root--resource-table zulip-root--topic-cache-key account))
+  "Return committed channel topic metadata owned by ACCOUNT."
+  (zulip-account-topics (or account zulip-root--account)))
 
 (defun zulip-root--topic-errors (&optional account)
-  "Return ACCOUNT's latest per-channel topic hydration errors."
-  (zulip-root--resource-table zulip-root--topic-errors-key account))
+  "Return ACCOUNT's retained topic acquisition failures."
+  (zulip-account-topic-errors (or account zulip-root--account)))
 
 (defun zulip-root--table-values (table)
   "Return all values stored in hash TABLE."
@@ -602,7 +573,8 @@ The authenticated user remains present for a self-DM."
            (zulip-account-connected-p account))
       "connected")
      ((and (zulip-account-p account)
-           (appkit-app-live-p (zulip-account-app account)))
+           (appkit-app-live-p (zulip-account-app account))
+           (zulip-account-events-enabled-p account))
       "connecting")
      (t "disconnected"))))
 
@@ -983,7 +955,7 @@ to `zulip-root-visible-topics-per-channel'."
   "Refresh and return the navigator's responsive presentation width."
   (setq-local zulip-root--fill-column
               (max 60
-                   (or (appkit-view-responsive-width 3)
+                   (or (appkit-surface-responsive-width (appkit-current-surface) 3)
                        (and (integerp zulip-root--fill-column)
                             zulip-root--fill-column)
                        80))))
@@ -993,57 +965,21 @@ to `zulip-root-visible-topics-per-channel'."
   (zulip-root--update-fill-column))
 
 (defun zulip-root--sync (&optional force-keys)
-  "Reconcile the current root, explicitly invalidating FORCE-KEYS."
-  (let ((view (appkit-current-view)))
-    (unless (appkit-view-live-p view)
-      (error "Zulip root sync requires a live Appkit view"))
-    (zulip-root--update-fill-column)
-    (setf (appkit-view-state view) (zulip-root--state))
-    (appkit-directory-reconcile
-     (appkit-directory-surface)
-     (mapcar #'zulip-root--directory-entry
-             (zulip-root--project-entries))
-     :force-keys force-keys
-     :preserve-position-p t)))
+  "Reconcile native directory rows while preserving the selected topic."
+  (zulip-root--update-fill-column)
+  (appkit-directory-reconcile
+   (appkit-directory-surface)
+   (mapcar #'zulip-root--directory-entry (zulip-root--project-entries))
+   :force-keys force-keys :preserve-position-p t))
 
-(defun zulip-root--sync-invalidations (_view invalidations _events)
-  "Synchronize the current root from coalesced INVALIDATIONS."
-  (let* ((entries (zulip-root--project-entries))
-         (diff
-          (appkit-projection-diff-derive
-           invalidations
-           :existing-keys (mapcar #'zulip-root--entry-key entries)
-           :reconcile-parts '(entries))))
-    (when (appkit-projection-diff-reconcile-p diff)
-      (zulip-root--sync (appkit-projection-diff-force-keys diff)))))
-
-(defun zulip-root--invalidate-and-sync (&optional force-keys)
-  "Invalidate the current root projection and synchronously reconcile it.
-
-FORCE-KEYS are stable entry keys that must be reprinted even when their
-projected values compare equal.  Production code uses this immediate form only
-for a newly attached buffer's first projection, before it is returned to the
-caller.  Runtime callbacks, commands, and geometry changes use the scheduled
-form so Appkit can coalesce their invalidations."
-  (let ((view (appkit-current-view)))
-    (unless (appkit-view-live-p view)
-      (error "Zulip root has no live Appkit view"))
-    (appkit-invalidate view
-                       :structure t
-                       :part 'entries
-                       :entries force-keys)
-    (appkit-sync-invalidations view)))
-
-(defun zulip-root--invalidate-and-schedule (&optional force-keys)
-  "Invalidate the current root projection and schedule an Appkit sync.
-
-FORCE-KEYS are stable entry keys that must be reprinted even when their
-projected values compare equal."
-  (let ((view (appkit-current-view)))
-    (unless (appkit-view-live-p view)
-      (error "Zulip root has no live Appkit view"))
-    (appkit-request-sync
-     view :structure t :part 'entries :entries force-keys)))
+(defun zulip-root--request-render (&optional force-keys)
+  "Commit a navigator projection request for FORCE-KEYS."
+  (let ((surface (appkit-current-surface))
+        (change (appkit-projection-change-create
+                 :full-p t :frame-p t :keys force-keys)))
+    (if zulip-runtime--transition-context
+        (zulip-runtime--post-surface surface change)
+      (appkit-surface-send surface change))))
 
 (defun zulip-root--view-id (account)
   "Return strict account-scoped root view identity for ACCOUNT."
@@ -1104,30 +1040,21 @@ MALFORMED-P denotes a successful HTTP response with an invalid payload."
                       t)
         :malformed-p (and malformed-p t)))
 
-(defun zulip-root--accept-topic-result (view channel-id result)
-  "Accept VIEW's current CHANNEL-ID topic request RESULT."
-  (appkit-with-live-view view
-    (if (and (zulip-api-result-p result)
-             (zulip-api-result-ok-p result))
-        (condition-case nil
-            (let ((models (zulip-root--topic-models-from-result result)))
-              (puthash channel-id models (zulip-root--topic-cache))
-              (remhash channel-id (zulip-root--topic-errors)))
-          (error
-           ;; A malformed success is not allowed to erase a previous cache.
-           (puthash channel-id
-                    (zulip-root--topic-error-record result t)
-                    (zulip-root--topic-errors))))
-      ;; Network/API failures retain the last good topic list.
-      (puthash channel-id
-               (zulip-root--topic-error-record result)
-               (zulip-root--topic-errors)))
-    ;; Appkit retires the keyed task before calling this finisher.  A short
-    ;; delay lets staggered HTTP callbacks accumulate behind one projection
-    ;; instead of repeatedly rebuilding a large root on Emacs's main thread.
-    (appkit-request-sync
-     view :structure t :part 'entries
-     :delay (max 0 zulip-root-topic-hydration-sync-delay))))
+(defun zulip-root--accept-topic-result (surface channel-id result)
+  "Commit the current SURFACE task RESULT without erasing last good metadata."
+  (when (appkit-surface-live-p surface)
+    (with-current-buffer (appkit-surface-buffer surface)
+      (if (and (zulip-api-result-p result) (zulip-api-result-ok-p result))
+          (condition-case nil
+              (let ((models (zulip-root--topic-models-from-result result)))
+                (puthash channel-id models (zulip-root--topic-cache))
+                (remhash channel-id (zulip-root--topic-errors)))
+            (error
+             (puthash channel-id (zulip-root--topic-error-record result t)
+                      (zulip-root--topic-errors))))
+        (puthash channel-id (zulip-root--topic-error-record result)
+                 (zulip-root--topic-errors)))
+      result)))
 
 (defun zulip-root--topic-concurrency-limit ()
   "Return the validated topic hydration concurrency limit."
@@ -1137,8 +1064,8 @@ MALFORMED-P denotes a successful HTTP response with an invalid payload."
 
 (defun zulip-root--ensure-topic-tasks (&optional view)
   "Return this root's Appkit topic task queue for live VIEW."
-  (setq view (or view (appkit-current-view)))
-  (unless (appkit-view-live-p view)
+  (setq view (or view (appkit-current-surface)))
+  (unless (appkit-surface-live-p view)
     (error "Zulip topic hydration requires a live root view"))
   (if (and (appkit-task-queue-live-p zulip-root--topic-tasks)
            (eq view (appkit-task-queue-owner zulip-root--topic-tasks)))
@@ -1151,24 +1078,22 @@ MALFORMED-P denotes a successful HTTP response with an invalid payload."
   zulip-root--topic-tasks)
 
 (defun zulip-root--submit-topic-request (channel)
-  "Submit one view-owned topic request for subscribed CHANNEL."
-  (let* ((view (appkit-current-view))
-         (queue (zulip-root--ensure-topic-tasks view))
+  "Queue one topic acquisition with exact Surface/App/account epoch authority."
+  (let* ((surface (appkit-current-surface))
+         (queue (zulip-root--ensure-topic-tasks surface))
          (account zulip-root--account)
+         (app (zulip-account-app account))
+         (epoch (zulip-account-generation account))
          (channel-id (zulip-root--channel-id channel))
-         (stream-id
-          (zulip-root--wire-integer channel-id "Zulip channel ID")))
+         (stream-id (zulip-root--wire-integer channel-id "Zulip channel ID")))
     (appkit-task-queue-submit
      queue channel-id
      (lambda (complete)
-       (let ((request
-               (zulip-api-get-topics
-                account stream-id complete :owner view)))
-         (when request
-           (lambda () (zulip-http-cancel-request request)))))
+       (zulip-api-get-topics account stream-id complete :owner surface))
      :finish
      (lambda (result)
-       (zulip-root--accept-topic-result view channel-id result)))))
+       (zulip-runtime--post-surface
+        surface (list 'topic-result account app epoch channel-id result))))))
 
 (defun zulip-root--prune-topic-tasks (subscribed-ids)
   "Cancel topic tasks whose keys are absent from SUBSCRIBED-IDS."
@@ -1209,43 +1134,19 @@ already active or queued request for the same channel.  At most
     queued))
 
 (defun zulip-root--queue-refresh (account event &optional refresh-topics-p)
-  "Queue EVENT and refresh ACCOUNT's live root view.
-
-When REFRESH-TOPICS-P is non-nil, request fresh server topic metadata even
-for channels already represented in the account cache."
-  (when (and (zulip-account-p account)
-             (appkit-app-live-p (zulip-account-app account)))
-    (when-let* ((view (appkit-view-for-id
-                       (zulip-account-app account)
-                       (zulip-root--view-id account))))
-      (appkit-view-enqueue-event view event)
-      (appkit-with-live-view view
-        (zulip-root--hydrate-topics refresh-topics-p))
-      (appkit-request-sync view :structure t :part 'entries))))
-
-(defun zulip-root--on-register (account state)
-  "Refresh ACCOUNT root after registration installs STATE."
-  (zulip-root--queue-refresh
-   account (list :type 'register :state state) t))
-
-(defun zulip-root--on-state-changed (change)
-  "Refresh the affected account root after canonical state CHANGE."
-  (when-let* ((account (plist-get change :account)))
-    (zulip-root--queue-refresh
-     account change (eq (plist-get change :type) 'subscription))))
-
-(defun zulip-root--ensure-event-subscriptions (account)
-  "Install one Appkit-owned root event fanout for ACCOUNT."
-  (let* ((app (zulip-account-app account))
-         (store (appkit-app-resource-store app)))
-    (unless (gethash zulip-root--event-subscriptions-key store)
-      (puthash
-       zulip-root--event-subscriptions-key
-       (list
-        (appkit-app-on app 'zulip-register #'zulip-root--on-register)
-        (appkit-app-on app 'zulip-state-changed
-                       #'zulip-root--on-state-changed))
-       store))))
+  "Route EVENT into ACCOUNT's exact root with protocol-epoch fencing."
+  (when (appkit-app-live-p (zulip-account-app account))
+    (when-let* ((surface (appkit-app-surface
+                          (zulip-account-app account)
+                          (zulip-root--view-id account))))
+      (let* ((events (if (equal (zulip-state-object-get event 'type) "event_batch")
+                         (zulip-state-object-get event 'events) (list event)))
+             (types (mapcar (lambda (item)
+                              (downcase (format "%s" (zulip-state-object-get item 'type))))
+                            events))
+             (reset (or (member "register" types) (member "epoch" types)))
+             (force (or refresh-topics-p (member "register" types) (member "subscription" types))))
+        (zulip-runtime--post-surface surface (list 'refresh force reset))))))
 
 (defun zulip-root--entry-at-point (&optional position)
   "Return root entry at POSITION, or current point."
@@ -1259,7 +1160,8 @@ for channels already represented in the account cache."
   (unless (and (zulip-root--entry-p entry)
                (zulip-root--entry-target entry))
     (user-error "No Zulip destination on this row"))
-  (unless (zulip-account-p zulip-root--account)
+  (unless (and (zulip-account-p zulip-root--account)
+               (appkit-surface-live-p (appkit-current-surface)))
     (user-error "This navigator has no live Zulip account"))
   (zulip-feed-open zulip-root--account
                    (zulip-root--entry-target entry)))
@@ -1276,7 +1178,6 @@ for channels already represented in the account cache."
   (interactive "e")
   (mouse-set-point event)
   (zulip-root-open-at-point))
-
 
 (defun zulip-root-next-row ()
   "Move to the next openable navigator row."
@@ -1413,16 +1314,9 @@ account topic cache."
            (user-error "Unknown Zulip destination: %s" label)))))))
 
 (defun zulip-root-refresh ()
-  "Refresh server topic metadata and the current navigator projection."
+  "Refresh topic metadata through the current navigator's committed update."
   (interactive)
-  (let ((started (zulip-root--hydrate-topics t)))
-    (zulip-root--invalidate-and-schedule
-     (mapcar #'zulip-root--entry-key (zulip-root--project-entries)))
-    (if (> started 0)
-        (message "Zulip: refreshing topic metadata for %d channel%s"
-                 started (if (= started 1) "" "s"))
-      (message "Zulip: topic metadata is already refreshing"))))
-
+  (appkit-surface-send (appkit-current-surface) '(refresh t nil)))
 
 (defvar-keymap zulip-root-mode-map
   :doc "Keymap for `zulip-root-mode'."
@@ -1447,41 +1341,38 @@ account topic cache."
   (zulip-root--configure-directory))
 
 (defun zulip-root--open-buffer (account)
-  "Open or reuse ACCOUNT's Appkit root view and return its buffer."
+  "Open ACCOUNT's stable Generated navigator and its bounded topic queue."
   (unless (and (zulip-account-p account)
                (appkit-app-live-p (zulip-account-app account)))
     (error "Zulip root requires a live account"))
   (let* ((app (zulip-account-app account))
-         (view-id (zulip-root--view-id account))
-         (existing (appkit-view-for-id app view-id))
-         (view
-          (appkit-open-view
-           :app app
-           :id view-id
-           :mode 'zulip-root-mode
-           :buffer-name (zulip-root--buffer-name account)
-           :state (zulip-account-state account)
-           :sync-function #'zulip-root--sync-invalidations
-           :parts '(frame entries geometry)
-           :setup
-           (lambda (new-view)
-             (appkit-view-enable-responsive-geometry new-view)
-             (zulip-root--configure-directory)
-             (setq-local zulip-root--account account)
-             ;; The buffer can survive a killed view.  Its replacement gets a
-             ;; fresh owner-scoped queue; the old queue and task tokens die
-             ;; with their detached Appkit view.
-             (setq-local zulip-root--topic-tasks nil)
-             (zulip-root--ensure-topic-tasks new-view)
-             (zulip-root--ensure-event-subscriptions account))))
-         (buffer (appkit-view-buffer view)))
-    (with-current-buffer buffer
-      (setq-local zulip-root--account account)
-      (zulip-root--ensure-event-subscriptions account)
-      (zulip-root--hydrate-topics)
-      (unless existing
-        (zulip-root--invalidate-and-sync)))
-    buffer))
+         (identity (zulip-root--view-id account))
+         (existing (appkit-app-surface app identity)))
+    (if (appkit-surface-live-p existing)
+        (appkit-surface-buffer existing)
+      (let* ((name (zulip-root--buffer-name account))
+             (surface (appkit-open-generated-surface
+                       zulip-root--surface-type :app app :identity identity
+                       :input account
+                       :buffer
+                       (when-let* ((candidate (get-buffer name)))
+                         (with-current-buffer candidate
+                           (when (and (derived-mode-p 'zulip-root-mode)
+                                      (not (appkit-current-surface))
+                                      (zulip-account-p zulip-root--account)
+                                      (equal (zulip-account-id zulip-root--account)
+                                             (zulip-account-id account)))
+                             candidate)))
+                       :buffer-name name)))
+        (with-current-buffer (appkit-surface-buffer surface)
+          (zulip-root--ensure-topic-tasks surface)
+          (appkit-surface-enable-responsive-geometry
+           surface (lambda (current _width)
+                     (zulip-runtime--post-surface
+                      current (appkit-projection-change-create
+                               :geometry-p t :frame-p t))))
+          (appkit-surface-send surface '(refresh nil nil)))
+        (appkit-surface-buffer surface)))))
 
 (defun zulip-root--read-account ()
   "Prompt for one live Zulip account."
@@ -1505,11 +1396,77 @@ account topic cache."
   (let ((buffer (zulip-root--open-buffer account)))
     (pop-to-buffer buffer)
     (with-current-buffer buffer
-      (appkit-view-refresh-responsive-geometry)
+      (appkit-surface-refresh-responsive-geometry (appkit-current-surface))
       (unless (zulip-root--entry-at-point)
         (goto-char (point-min))
         (zulip-root-next-row)))
     buffer))
+
+(defun zulip-root--surface-init (context account)
+  "Initialize one navigator with exact App and Surface routing authority."
+  (setq-local zulip-root--account account
+              zulip-runtime--surface-address
+              (appkit-transition-context-owner-address context))
+  (appkit-next :model account
+               :render (appkit-projection-change-create :full-p t :frame-p t)))
+
+(defun zulip-root--surface-update (context account message)
+  "Commit root actions and response state before running acquisition Effects."
+  (let ((zulip-runtime--transition-context context)
+        zulip-runtime--commands
+        (change appkit-render-none))
+    (pcase message
+      ((pred appkit-projection-change-p) (setq change message))
+      (`(start-effect ,effect)
+       (push (appkit-command-start-effect effect) zulip-runtime--commands))
+      (`(cancel-effect ,key)
+       (push (appkit-command-cancel-effect key) zulip-runtime--commands))
+      (`(response ,callback ,result)
+       (funcall callback result)
+       (setq change (appkit-projection-change-create :full-p t :frame-p t)))
+      (`(topic-result ,captured ,app ,epoch ,channel-id ,result)
+       (when (and (eq captured account) (eq app (zulip-account-app account))
+                  (= epoch (zulip-account-generation account)))
+         (zulip-root--accept-topic-result (appkit-current-surface) channel-id result)
+         (setq change (appkit-projection-change-create :full-p t :frame-p t))))
+      (`(refresh ,force ,reset)
+       (when reset
+         (when (appkit-task-queue-live-p zulip-root--topic-tasks)
+           (appkit-task-queue-cancel zulip-root--topic-tasks))
+         (setq zulip-root--topic-tasks nil))
+       (unless (and reset (not (zulip-account-connected-p account)))
+         (zulip-root--hydrate-topics force))
+       (setq change (appkit-projection-change-create :full-p t :frame-p t))))
+    (appkit-next :model account :render change
+                 :commands (nreverse zulip-runtime--commands))))
+
+(defun zulip-root--renderer (_surface)
+  "Create a native directory projection renderer for one navigator."
+  (appkit-generated-renderer-create
+   :mount (lambda (_surface _app _model) (zulip-root--configure-directory))
+   :merge #'appkit-projection-change-merge
+   :render
+   (lambda (_surface _app _model change)
+     (zulip-root--sync
+      (if (appkit-projection-change-geometry-p change)
+          (mapcar #'zulip-root--entry-key (zulip-root--project-entries))
+        (appkit-projection-change-keys change)))
+     nil)
+   :recover (lambda (_surface _app _model _condition)
+              (zulip-root--sync
+               (mapcar #'zulip-root--entry-key (zulip-root--project-entries)))
+              nil)
+   :unmount (lambda (_surface) nil)))
+
+(defconst zulip-root--surface-type
+  (appkit-surface-type-create
+   :name 'zulip-root :mode #'zulip-root--initialize-mode
+   :init #'zulip-root--surface-init :update #'zulip-root--surface-update
+   :renderer-factory #'zulip-root--renderer))
+
+(defun zulip-root--initialize-mode ()
+  "Initialize a derived navigator mode before attaching its new Surface."
+  (funcall (if (derived-mode-p 'zulip-root-mode) major-mode #'zulip-root-mode)))
 
 (provide 'zulip-root)
 

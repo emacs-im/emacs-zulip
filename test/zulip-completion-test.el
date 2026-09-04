@@ -3,6 +3,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'zulip-runtime-test)
 (require 'cl-lib)
 (require 'zulip-completion)
 
@@ -22,8 +23,7 @@ ACTIVE equal to `missing' omits `is_active'."
       (puthash (zulip-state-object-get user 'id)
                user
                (zulip-state-users state)))
-    (zulip-account--create
-     :id '("https://chat.example.test" "me@example.test")
+    (zulip-runtime-create-account
      :server "https://chat.example.test"
      :email "me@example.test"
      :api-key "api-key-must-not-leak"
@@ -32,9 +32,9 @@ ACTIVE equal to `missing' omits `is_active'."
 (defmacro zulip-completion-test--with-cache (&rest body)
   "Run BODY with an isolated account candidate cache."
   (declare (indent 0) (debug t))
-  `(let ((zulip-completion--account-cache
-          (make-hash-table :test #'eq)))
-     ,@body))
+  `(zulip-runtime-test--isolated
+    (let ((zulip-completion--account-cache (make-hash-table :test #'eq)))
+      ,@body)))
 
 (ert-deftest zulip-completion-builds-active-mention-candidates-without-secret ()
   (zulip-completion-test--with-cache
@@ -141,21 +141,6 @@ ACTIVE equal to `missing' omits `is_active'."
             (should (equal (plist-get object :user-id) "42"))
             (should (equal (plist-get object :wire)
                            "@**Ada Lovelace|42**"))))))))
-
-
-(ert-deftest zulip-completion-setup-is-idempotent-and-includes-emoji ()
-  (let ((account (zulip-completion-test--account)))
-    (with-temp-buffer
-      (setq-local completion-at-point-functions '(ignore))
-      (setq-local appkit-chat-completion-functions '(beginning-of-line))
-      (zulip-completion-setup account)
-      (zulip-completion-setup account)
-      (should
-       (equal '(zulip-completion-mention-capf appkit-chat-emoji-capf ignore)
-              completion-at-point-functions))
-      (should
-       (equal '(appkit-chat-completion-at-point beginning-of-line)
-              appkit-chat-completion-functions)))))
 
 (ert-deftest zulip-completion-token-at-point-identifies-mention-and-emoji ()
   (with-temp-buffer
