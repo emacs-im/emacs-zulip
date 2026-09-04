@@ -174,7 +174,7 @@ when credentials are refreshed."
         (condition-case error-data
             (progn
               (setq app
-                    (appkit-start-app
+                    (appkit-app-start
                      'zulip :id id :state nil :transport account))
               (setf (zulip-account-app account) app)
               (zulip-runtime-publish-state account state)
@@ -184,7 +184,7 @@ when credentials are refreshed."
               account)
           (error
            (when (appkit-app-p app)
-             (ignore-errors (appkit-stop-app app)))
+             (ignore-errors (appkit-app-close app)))
            (zulip-runtime--clear-api-key account)
            (remhash id zulip-runtime--accounts)
            (signal (car error-data) (cdr error-data))))))))
@@ -199,7 +199,7 @@ when credentials are refreshed."
       (zulip-events-stop account))
     (let ((app (zulip-account-app account)))
       (if (appkit-app-p app)
-          (appkit-stop-app app)
+          (appkit-app-close app)
         (zulip-runtime--clear-api-key account)
         (remhash (zulip-account-id account) zulip-runtime--accounts)))
     t))
