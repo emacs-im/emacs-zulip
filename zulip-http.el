@@ -166,21 +166,16 @@ PARSE-ERROR preserves a JSON parsing condition.  OK-P is non-nil only for a
     t))
 
 (defun zulip-http-cancel-request (request)
-  "Cancel asynchronous REQUEST returned by `zulip-http-request'.
-
-When REQUEST belongs to an Appkit application or view, cancel its lifecycle
-handle so the handle is removed from its owner as well as stopping the process.
-A raw process without an Appkit handle is cancelled directly; this fallback
-also supports transport test doubles that return an unregistered pipe process."
-  (when (processp request)
-    (let ((handle
-           (process-get request zulip-http--appkit-handle-property)))
-      (if (and (appkit-handle-p handle)
-               (appkit-handle-alive-p handle))
+  "Cancel REQUEST's actual Surface/App capability or raw Source transport."
+  (cond
+   ((appkit-handle-p request) (appkit-cancel-handle request))
+   ((processp request)
+    (let ((handle (process-get request zulip-http--appkit-handle-property)))
+      (if (and (appkit-handle-p handle) (appkit-handle-alive-p handle))
           (appkit-cancel-handle handle)
-        (zulip-http--cancel-process request)))))
+        (zulip-http--cancel-process request))))))
 
-(cl-defun zulip-http-request
+(cl-defun zulip-http--transport-request
     (account method endpoint params callback &key timeout headers owner)
   "Asynchronously request ACCOUNT ENDPOINT using METHOD and PARAMS.
 
@@ -192,7 +187,7 @@ parameters from either request.POST or request.GET.  POST and PATCH parameters
 use an application/x-www-form-urlencoded body.
 
 Return the plz process, or nil when request setup itself failed.  OWNER may be
-a live Appkit application or view and defaults to ACCOUNT's application.  The
+a live Appkit application or Surface and defaults to ACCOUNT's application.  The
 owner retains the process until it completes.  Pass the returned process to
 `zulip-http-cancel-request' to cancel it early."
   (unless (functionp callback)
@@ -201,13 +196,15 @@ owner retains the process until it completes.  Pass the returned process to
         process handle done)
     (cl-labels
         ((finish
-          (result)
-          (unless done
-            (setq done t)
-            (when handle
-              (ignore-errors (appkit-cancel-handle handle))
-              (setq handle nil))
-            (funcall callback result))))
+           (result)
+           (unless done
+             (setq done t)
+             (when handle
+               (appkit-retire-handle handle)
+               (when (processp process)
+                 (process-put process zulip-http--appkit-handle-property nil))
+               (setq handle nil))
+             (funcall callback result))))
       (condition-case err
           (let* ((method (zulip-http--method method))
                  (encoded (and params (zulip-http-encode-params params)))
@@ -242,7 +239,9 @@ owner retains the process until it completes.  Pass the returned process to
                             (finish (zulip-http--response-result response)))
                     :else (lambda (error-data)
                             (finish (zulip-http--error-result error-data)))))
-            ;; A test double may complete synchronously before returning.
+            (unless (or done (processp process))
+              (error "Zulip transport returned no pending process"))
+            ;; A transport may complete synchronously before returning.
             (when (and (not done)
                        (processp process)
                        owner)
@@ -266,6 +265,71 @@ owner retains the process until it completes.  Pass the returned process to
              (zulip-http-cancel-request process))
            (finish (zulip-http--setup-error-result err)))))
       process)))
+
+(defvar zulip-http--source-request-p nil
+  "Non-nil only while the App Source starts its own transport.")
+
+(cl-defun zulip-http-request
+    (account method endpoint params callback &key timeout headers owner)
+  "Run a request Effect owned by the concrete App or Surface OWNER.
+
+Return its real cancellation handle.  Source adapters own raw transports;
+ordinary callbacks run only in the exact owner's committed response update."
+  (unless (functionp callback) (error "Zulip HTTP callback must be callable"))
+  (let* ((app (zulip-account-app account))
+         (owner (or owner app)))
+    (unless (and (appkit-owner-live-p owner) (eq app (appkit-owner-app owner)))
+      (error "Zulip HTTP requires the account's live App or Surface"))
+    (if zulip-http--source-request-p
+        (zulip-http--transport-request account method endpoint params callback
+                                       :timeout timeout :headers headers :owner owner)
+      (let ((generation (zulip-account-generation account))
+            (key (make-symbol "zulip-http-"))
+            (active t)
+            effect-cancelling process handle)
+        (setq handle
+              (appkit-register-handle
+               owner 'request nil
+               (lambda (_)
+                 (setq active nil)
+                 (when process (zulip-http-cancel-request process))
+                 (when (and (not effect-cancelling) (appkit-owner-live-p owner))
+                   (zulip-runtime--post-owner owner (list 'cancel-effect key))))))
+        (cl-labels
+            ((settle
+               (result)
+               (let ((current (and active (eq app (zulip-account-app account))
+                                   (= generation (zulip-account-generation account)))))
+                 (setq active nil)
+                 (appkit-retire-handle handle)
+                 (when current (funcall callback result)))))
+          (zulip-runtime--post-owner
+           owner
+           (list
+            'start-effect
+            (appkit-effect-create
+             :key key :input nil
+             :start
+             (lambda (_context _input _observe resolve _reject)
+               (if (and active (appkit-owner-live-p owner)
+                        (eq app (zulip-account-app account))
+                        (= generation (zulip-account-generation account)))
+                   (setq process
+                         (zulip-http--transport-request
+                          account method endpoint params resolve
+                          :timeout timeout :headers headers :owner owner))
+                 (funcall resolve nil))
+               (appkit-cancellation-create
+                :kind 'transport :cancel (lambda ()
+                                           (setq effect-cancelling t)
+                                           (unwind-protect
+                                               (appkit-cancel-handle handle)
+                                             (setq effect-cancelling nil)))))
+             :success (lambda (_input result) (list 'response #'settle result))
+             :failure (lambda (_input reason)
+                        (list 'response #'settle (zulip-http--setup-error-result reason)))
+             :cancellation-requirement 'transport))))
+        handle))))
 
 (provide 'zulip-http)
 

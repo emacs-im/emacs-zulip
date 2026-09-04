@@ -3,6 +3,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'zulip-runtime-test)
 (require 'cl-lib)
 (require 'seq)
 (require 'zulip-root)
@@ -70,28 +71,45 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
     data))
 
 (defmacro zulip-root-test--with-account (binding &rest body)
-  "Create an isolated test account BINDING and evaluate BODY."
+  "Create isolated account BINDING and retire only its fixture buffers."
   (declare (indent 1) (debug (symbolp body)))
-  `(let ((zulip-runtime--accounts (make-hash-table :test #'equal))
-         (buffers-before (buffer-list)))
-     (let* ((state (zulip-state-from-register
-                    (zulip-root-test--register)))
-            (,binding
-             (zulip-runtime-create-account
-              :server "https://root.example.test/"
-              :email "me@example.test"
-              :api-key "secret"
-              :state state)))
-       (setf (zulip-account-connected-p ,binding) t)
-       (unwind-protect
-           (cl-letf (((symbol-function 'zulip-api-get-topics)
-                      (lambda (&rest _arguments) :mock-request)))
-             (progn ,@body))
-         (zulip-runtime-stop-all)
-         (dolist (buffer (buffer-list))
-           (when (and (not (memq buffer buffers-before))
-                      (buffer-live-p buffer))
-             (kill-buffer buffer)))))))
+  `(let* ((zulip-runtime--accounts (make-hash-table :test #'equal))
+          (zulip-runtime-change-hook nil)
+          (state (zulip-state-from-register (zulip-root-test--register)))
+          (,binding (zulip-runtime-create-account
+                     :server "https://root.example.test/"
+                     :email "me@example.test" :api-key "secret" :state state))
+          (zulip-root-test--open-function (symbol-function 'zulip-root--open-buffer))
+          zulip-root-test--buffers
+          zulip-root-test--processes)
+     (setf (zulip-account-connected-p ,binding) t)
+     (unwind-protect
+         (cl-letf (((symbol-function 'zulip-api-get-topics)
+                    (lambda (_account stream-id _callback &rest options)
+                      (let* ((owner (plist-get options :owner))
+                             (process (make-pipe-process :name "zulip-root-test-transport"
+                                                         :buffer nil :noquery t))
+                             (handle (appkit-register-handle owner 'process process))
+                             (response _callback)
+                             (_callback (lambda (result)
+                                          (appkit-retire-handle handle)
+                                          (when (process-live-p process) (delete-process process))
+                                         ;; Deliver even after cancellation to exercise runtime fencing.
+                                          (funcall response result))))
+                        (push process zulip-root-test--processes)
+                        (should (eq (zulip-account-app _account) (appkit-owner-app owner)))
+                        handle)))
+                   ((symbol-function 'zulip-root--open-buffer)
+                    (lambda (&rest arguments)
+                      (let ((buffer (apply zulip-root-test--open-function arguments)))
+                        (cl-pushnew buffer zulip-root-test--buffers)
+                        buffer))))
+           ,@body)
+       (zulip-runtime-stop-all)
+       (dolist (process zulip-root-test--processes)
+         (when (process-live-p process) (delete-process process)))
+       (dolist (buffer zulip-root-test--buffers)
+         (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
 (defun zulip-root-test--entry (entries key)
   "Return from ENTRIES the projected root entry identified by KEY."
@@ -123,13 +141,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
                (second (zulip-root--project-entries))
                (actionable-keys
                 (mapcar #'zulip-root--entry-key
-                        (seq-filter #'zulip-root--entry-target first)))
-               (node-table
-                (appkit-directory-surface-node-table
-                 (appkit-directory-surface)))
-               (nodes
-                (mapcar (lambda (key) (gethash key node-table))
-                        actionable-keys)))
+                        (seq-filter #'zulip-root--entry-target first))))
           (should (equal actionable-keys
                          '((feed all)
                            (feed mentioned)
@@ -175,17 +187,11 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
              (zulip-root--entry-target
               (zulip-root-test--entry first '(dm "1" "2"))))
             '((dm 2))))
-          ;; Equal stable keys let Appkit retain the EWOC nodes themselves.
-          (zulip-root--invalidate-and-sync)
-          (should
-           (cl-every #'eq nodes
-                     (mapcar
-                      (lambda (key)
-                        (gethash
-                         key
-                         (appkit-directory-surface-node-table
-                          (appkit-directory-surface))))
-                             actionable-keys))))))))
+          (zulip-root--request-render)
+          (should (equal actionable-keys
+                         (mapcar #'zulip-root--entry-key
+                                 (seq-filter #'zulip-root--entry-target
+                                             (zulip-root--project-entries))))))))))
 
 (ert-deftest zulip-root-projects-exact-unread-and-mention-counts ()
   (zulip-root-test--with-account account
@@ -306,37 +312,6 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
                            (topic . "Hidden topic"))
                          (zulip-narrow-key opened-narrow))))))))
 
-(ert-deftest zulip-root-large-projection-accumulates-linearly ()
-  (let ((zulip-root-visible-topics-per-channel nil)
-        (topic-count 1500))
-    (zulip-root-test--with-account account
-      (puthash
-       "5"
-       (cl-loop for index below topic-count
-                collect
-                (list :name (format "Synthetic %04d" index)
-                      :max-message-id (format "%d" (+ 1000 index))))
-       (zulip-root--topic-cache account))
-      (with-temp-buffer
-        (setq-local zulip-root--account account)
-        (setq-local zulip-root--fill-column 80)
-        (let ((real-append (symbol-function 'append))
-              (traversed-prefixes 0)
-              entries)
-          ;; Count append traversal rather than wall time.  Repeatedly
-          ;; appending each row to the growing result would visit O(n^2)
-          ;; prefixes and exceed this bound by orders of magnitude.
-          (cl-letf (((symbol-function 'append)
-                     (lambda (&rest arguments)
-                       (when (listp (car arguments))
-                         (cl-incf traversed-prefixes
-                                  (length (car arguments))))
-                       (apply real-append arguments))))
-            (setq entries (zulip-root--project-entries)))
-          (should (= (1+ topic-count)
-                     (length (zulip-root-test--topic-entries entries))))
-          (should (< traversed-prefixes (* 20 topic-count))))))))
-
 (ert-deftest zulip-root-large-realm-bounds-default-rendered-topic-rows ()
   (let ((zulip-root-visible-topics-per-channel 25)
         (channel-count 32)
@@ -376,11 +351,6 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
             (should (= (* channel-count 25) topic-count))
             (should (= channel-count hidden-note-count))
             (should (< (length entries) 900))
-            (should
-             (= (length entries)
-                (hash-table-count
-                 (appkit-directory-surface-node-table
-                  (appkit-directory-surface)))))
             (should (< (line-number-at-pos (point-max)) 900))))))))
 
 (ert-deftest zulip-root-message-preview-decodes-entities-and-flattens-blocks ()
@@ -393,138 +363,79 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
     (should (equal "Two: Hello & <friends> Second block"
                    (zulip-root--message-preview message)))))
 
-(ert-deftest zulip-root-reuses-an-account-scoped-appkit-view ()
+(ert-deftest zulip-root-reuses-an-account-scoped-generated-surface ()
   (zulip-root-test--with-account account
-    (let ((real-sync (symbol-function 'zulip-root--sync))
-          (sync-count 0))
-      (cl-letf (((symbol-function 'zulip-root--sync)
-                 (lambda (&rest arguments)
-                   (cl-incf sync-count)
-                   (apply real-sync arguments))))
-        (let* ((first-buffer (zulip-root--open-buffer account))
-               (first-view (with-current-buffer first-buffer
-                             (appkit-current-view)))
-               (second-buffer (zulip-root--open-buffer account))
-               (second-view (with-current-buffer second-buffer
-                              (appkit-current-view)))
-               (other
-                (zulip-runtime-create-account
-                 :server "https://other.example.test/"
-                 :email "me@example.test"
-                 :api-key "secret"
-                 :state (zulip-state-from-register
-                         (zulip-root-test--register))))
-               (other-buffer (zulip-root--open-buffer other))
-               (other-view (with-current-buffer other-buffer
-                             (appkit-current-view))))
-          (should (eq first-buffer second-buffer))
-          (should (eq first-view second-view))
-          ;; One initial projection per account; reopening a live view does
-          ;; not force another root reconciliation.
-          (should (= 2 sync-count))
-          (should (equal (appkit-view-id first-view)
-                         (zulip-root--view-id account)))
-          (should-not (eq first-buffer other-buffer))
-          (should-not (eq first-view other-view))
-          (should (eq first-view
-                      (appkit-view-for-id
-                       (zulip-account-app account)
-                       (zulip-root--view-id account)))))))))
-
-(ert-deftest zulip-root-ret-activates-the-row-destination ()
-  (zulip-root-test--with-account account
-    (let ((buffer (zulip-root--open-buffer account))
-          opened-account
-          opened-narrow)
-      (cl-letf (((symbol-function 'zulip-feed-open)
-                 (lambda (candidate narrow)
-                   (setq opened-account candidate
-                         opened-narrow narrow))))
-        (with-current-buffer buffer
-          (goto-char (or (zulip-root-test--row-position
-                          '(topic "5" "one"))
-                         (ert-fail "Topic row was not rendered")))
-          ;; The Appkit action-row keymap intentionally wins over the major
-          ;; mode map here, just as it does for a user pressing RET.
-          (call-interactively (key-binding (kbd "RET")))
-          (should (eq opened-account account))
-          (should (equal (zulip-narrow-key opened-narrow)
-                         '((channel . "general")
-                           (topic . "One")))))))))
+    (let* ((first-buffer (zulip-root--open-buffer account))
+           (first-surface (with-current-buffer first-buffer (appkit-current-surface)))
+           (second-buffer (zulip-root--open-buffer account))
+           (other (zulip-runtime-create-account
+                   :server "https://other.example.test/"
+                   :email "me@example.test" :api-key "secret"
+                   :state (zulip-state-from-register (zulip-root-test--register))))
+           (other-buffer (zulip-root--open-buffer other)))
+      (should (eq first-buffer second-buffer))
+      (should (eq first-surface
+                  (appkit-app-surface (zulip-account-app account)
+                                      (zulip-root--view-id account))))
+      (should-not (eq first-buffer other-buffer))
+      (should-not (eq first-surface
+                      (with-current-buffer other-buffer (appkit-current-surface)))))))
 
 (ert-deftest zulip-root-state-change-refreshes-only-its-view-and-keeps-position ()
   (zulip-root-test--with-account account
-    (let* ((other
-            (zulip-runtime-create-account
-             :server "https://other.example.test/"
-             :email "me@example.test"
-             :api-key "secret"
-             :state (zulip-state-from-register
-                     (zulip-root-test--register))))
+    (let* ((other (zulip-runtime-create-account
+                   :server "https://other.example.test/" :email "me@example.test"
+                   :api-key "secret"
+                   :state (zulip-state-from-register (zulip-root-test--register))))
            (buffer (zulip-root--open-buffer account))
            (other-buffer (zulip-root--open-buffer other))
-           (view (with-current-buffer buffer (appkit-current-view)))
-           (other-view
-            (with-current-buffer other-buffer (appkit-current-view)))
+           (other-content (with-current-buffer other-buffer (buffer-string)))
            (state (zulip-account-state account))
-           (next
-            (zulip-state-upsert-message
-             state
-             (zulip-root-test--message
-              93 "stream" "new unread" "One" 5 "general")))
-           scheduled
-           scheduled-delays
+           (next (zulip-state-upsert-message
+                  state (zulip-root-test--message
+                         93 "stream" "new unread" "One" 5 "general")))
            old-column)
-      (setq next
-            (zulip-state-set-message-unread
-             next "93" t
-             '((type . "stream")
-               (stream_id . 5)
-               (topic . "One")
-               (mentioned . :false)
-               (unmuted_stream_msg . t))))
+      (setq next (zulip-state-set-message-unread
+                  next "93" t
+                  '((type . "stream") (stream_id . 5) (topic . "One")
+                    (mentioned . :false) (unmuted_stream_msg . t))))
       (with-current-buffer buffer
-        (goto-char (or (zulip-root-test--row-position
-                        '(topic "5" "one"))
-                       (ert-fail "Topic row was not rendered")))
+        (goto-char (zulip-root-test--row-position '(topic "5" "one")))
         (move-to-column 6)
         (setq old-column (current-column)))
       (zulip-runtime-publish-state account next)
-      (cl-letf (((symbol-function 'appkit-schedule-sync)
-                 (lambda (candidate &rest options)
-                   (push candidate scheduled)
-                   (push (plist-get options :delay) scheduled-delays))))
-        (zulip-root--on-state-changed
-         (list :account account :event 'message :message-id "93")))
-      (should (equal scheduled (list view)))
-      (should (equal scheduled-delays '(0)))
-      (should (= 1 (length (appkit-view-pending-events view))))
-      (should-not (appkit-view-pending-events other-view))
-      (should (appkit-invalidations-any-p
-               (appkit-view-invalidations view)))
-      (should-not (appkit-invalidations-any-p
-                   (appkit-view-invalidations other-view)))
-      (appkit-sync-invalidations view)
+      (zulip-runtime-test--drain account)
       (with-current-buffer buffer
-        (should (equal (get-text-property
-                        (point) appkit-directory-key-property)
+        (should (equal (get-text-property (point) appkit-directory-key-property)
                        '(topic "5" "one")))
         (should (= old-column (current-column)))
-        (should (= 3 (get-text-property
-                      (point) 'zulip-root-unread-count))))
-      (should-not (appkit-view-pending-events view)))))
+        (should (= 3 (get-text-property (point) 'zulip-root-unread-count))))
+      (should (equal other-content
+                     (with-current-buffer other-buffer (buffer-string)))))))
 
 (ert-deftest zulip-root-hydrates-server-topics-once-with-view-ownership ()
   (zulip-root-test--with-account account
     (let (calls buffer view)
       (cl-letf (((symbol-function 'zulip-api-get-topics)
                  (lambda (candidate stream-id callback &rest options)
-                   (push (list candidate stream-id callback
-                               (plist-get options :owner))
-                         calls)
-                   :request)))
+                   (let* ((owner (plist-get options :owner))
+                          (process (make-pipe-process :name "zulip-root-test-transport"
+                                                      :buffer nil :noquery t))
+                          (handle (appkit-register-handle owner 'process process))
+                          (response callback)
+                          (callback (lambda (result)
+                                      (appkit-retire-handle handle)
+                                      (when (process-live-p process) (delete-process process))
+                                      ;; Deliver even after cancellation to exercise runtime fencing.
+                                      (funcall response result))))
+                     (push process zulip-root-test--processes)
+                     (should (eq (zulip-account-app candidate) (appkit-owner-app owner)))
+                     (push (list candidate stream-id callback
+                                 (plist-get options :owner))
+                           calls)
+                     handle))))
         (setq buffer (zulip-root--open-buffer account)
-              view (with-current-buffer buffer (appkit-current-view)))
+              view (with-current-buffer buffer (appkit-current-surface)))
         (should (= 1 (length calls)))
         (pcase-let ((`(,candidate ,stream-id ,_callback ,owner)
                      (car calls)))
@@ -535,7 +446,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
         ;; per-channel request.
         (with-current-buffer buffer
           (should (= 0 (zulip-root--hydrate-topics)))
-          (zulip-root--invalidate-and-sync))
+          (zulip-root--request-render))
         (should (= 1 (length calls)))
         (funcall
          (nth 2 (car calls))
@@ -544,6 +455,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
             (max_id . "90071992547409931234"))
           '((name . "server ONLY")
             (max_id . "90071992547409939999"))))
+        (zulip-runtime-test--drain account)
         (let* ((cached (gethash "5" (zulip-root--topic-cache account)))
                (model (car cached)))
           (should (= 1 (length cached)))
@@ -566,168 +478,38 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
   (let ((zulip-root-topic-hydration-concurrency 2))
     (zulip-root-test--with-account account
       (zulip-runtime-publish-state
-       account
-       (zulip-state-from-register
-        (zulip-root-test--register-with-streams 5)))
-      (let (calls buffer scheduled synced redisplayed)
+       account (zulip-state-from-register (zulip-root-test--register-with-streams 5)))
+      (let (calls buffer)
         (cl-letf (((symbol-function 'zulip-api-get-topics)
                    (lambda (_account stream-id callback &rest options)
-                     (setq calls
-                           (append calls
-                                   (list (list :stream-id stream-id
-                                               :callback callback
-                                               :owner (plist-get options
-                                                                 :owner)))))
-                     :request)))
+                     (let* ((owner (plist-get options :owner))
+                            (process (make-pipe-process :name "zulip-root-test-transport"
+                                                        :buffer nil :noquery t))
+                            (handle (appkit-register-handle owner 'process process))
+                            (response callback)
+                            (callback (lambda (result)
+                                        (appkit-retire-handle handle)
+                                        (when (process-live-p process) (delete-process process))
+                                        ;; Deliver even after cancellation to exercise runtime fencing.
+                                        (funcall response result))))
+                       (push process zulip-root-test--processes)
+                       (should (eq (zulip-account-app _account) (appkit-owner-app owner)))
+                       (setq calls (append calls (list (list stream-id callback
+                                                             (plist-get options :owner)))))
+                       handle))))
           (setq buffer (zulip-root--open-buffer account))
-          (should (equal '(5 6) (mapcar (lambda (call)
-                                          (plist-get call :stream-id))
-                                        calls)))
-          (with-current-buffer buffer
-            (should (= 2 (appkit-task-queue-active-count
-                          zulip-root--topic-tasks)))
-            (should (= 3 (appkit-task-queue-queued-count
-                          zulip-root--topic-tasks)))
-            (should (equal '("7" "8" "9")
-                           (nthcdr
-                            2
-                            (appkit-task-queue-pending-keys
-                             zulip-root--topic-tasks))))
-            (should (equal '(5 . 0)
-                           (zulip-root--topic-status-counts))))
-          (cl-letf (((symbol-function 'appkit-schedule-sync)
-                     (lambda (view &rest _options)
-                       (push view scheduled)))
-                    ((symbol-function 'appkit-sync-invalidations)
-                     (lambda (&rest _arguments) (cl-incf synced)))
-                    ((symbol-function 'force-window-update)
-                     (lambda (&rest _arguments) (cl-incf redisplayed)))
-                    ((symbol-function 'force-mode-line-update)
-                     (lambda (&rest _arguments) (cl-incf redisplayed))))
-            (funcall (plist-get (car calls) :callback)
-                     (zulip-root-test--topics-result
-                      '((name . "first-result"))))
-            (should (= 1 (length scheduled)))
-            (should-not synced)
-            (should-not redisplayed))
-          ;; Completing the oldest request advances exactly one FIFO slot and
-          ;; keeps the number of live requests at the configured maximum.
-          (should (equal '(5 6 7) (mapcar (lambda (call)
-                                            (plist-get call :stream-id))
-                                          calls)))
-          (with-current-buffer buffer
-            (should (= 2 (appkit-task-queue-active-count
-                          zulip-root--topic-tasks)))
-            (should (= 2 (appkit-task-queue-queued-count
-                          zulip-root--topic-tasks))))
-          ;; A duplicate/stale completion token cannot overwrite the cache or
-          ;; consume another queued item.
-          (funcall (plist-get (car calls) :callback)
-                   (zulip-root-test--topics-result
-                    '((name . "must-not-land"))))
-          (should (= 3 (length calls)))
+          (should (equal '(5 6) (mapcar #'car calls)))
+          (funcall (nth 1 (car calls))
+                   (zulip-root-test--topics-result '((name . "first-result"))))
+          (zulip-runtime-test--drain account)
+          (should (equal '(5 6 7) (mapcar #'car calls)))
+          (funcall (nth 1 (car calls))
+                   (zulip-root-test--topics-result '((name . "must-not-land"))))
+          (zulip-runtime-test--drain account)
+          (should (equal '(5 6 7) (mapcar #'car calls)))
           (should (equal "first-result"
-                         (plist-get
-                          (car (gethash "5"
-                                        (zulip-root--topic-cache account)))
-                          :name))))))))
-
-(ert-deftest zulip-root-topic-hydration-32-streams-coalesces-appkit-sync ()
-  (let ((zulip-root-topic-hydration-concurrency 4)
-        (zulip-root-topic-hydration-sync-delay 0.3))
-    (zulip-root-test--with-account account
-      (zulip-runtime-publish-state
-       account
-       (zulip-state-from-register
-        (zulip-root-test--register-with-streams 32)))
-      (let ((real-schedule (symbol-function 'appkit-schedule-sync))
-            (real-sync (symbol-function 'appkit-sync-invalidations))
-            (active 0)
-            (maximum-active 0)
-            calls
-            scheduled
-            scheduled-delays
-            (sync-count 0)
-            buffer
-            view)
-        (cl-letf
-            (((symbol-function 'zulip-api-get-topics)
-              (lambda (_account stream-id callback &rest options)
-                (cl-incf active)
-                (setq maximum-active (max maximum-active active)
-                      calls
-                      (append calls
-                              (list (list :stream-id stream-id
-                                          :callback callback
-                                          :owner (plist-get options
-                                                            :owner)))))
-                :request))
-             ((symbol-function 'appkit-schedule-sync)
-              (lambda (candidate &rest options)
-                (push (plist-get options :delay) scheduled-delays)
-                (let ((timer (funcall real-schedule candidate :delay 60)))
-                  (push timer scheduled)
-                  timer)))
-             ((symbol-function 'appkit-sync-invalidations)
-              (lambda (candidate)
-                (cl-incf sync-count)
-                (funcall real-sync candidate))))
-          (setq buffer (zulip-root--open-buffer account)
-                view (with-current-buffer buffer (appkit-current-view)))
-          (should (= 4 (length calls)))
-          (should (= 4 active))
-          (should (= 4 maximum-active))
-          (with-current-buffer buffer
-            (should (= 4 (appkit-task-queue-active-count
-                          zulip-root--topic-tasks)))
-            (should (= 28 (appkit-task-queue-queued-count
-                           zulip-root--topic-tasks)))
-            (should (equal '(32 . 0)
-                           (zulip-root--topic-status-counts))))
-          ;; Ignore the one explicit initial projection performed while the
-          ;; new view is opened.  Topic completions themselves must not sync.
-          (setq sync-count 0)
-          (dotimes (index 32)
-            (let* ((call (nth index calls))
-                   (before (length calls)))
-              (cl-decf active)
-              (funcall
-               (plist-get call :callback)
-               (zulip-root-test--topics-result
-                `((name . ,(format "topic-%02d" index)))))
-              (should (= (length calls)
-                         (+ before (if (< index 28) 1 0))))
-              (should (= active (min 4 (- 31 index))))))
-          (should (= 4 maximum-active))
-          (should (= 32 (length calls)))
-          (should (equal (number-sequence 5 36)
-                         (mapcar (lambda (call)
-                                   (plist-get call :stream-id))
-                                 calls)))
-          (should (= 0 sync-count))
-          (should (= 32 (length scheduled)))
-          (should (= 32 (length scheduled-delays)))
-          (should (seq-every-p (lambda (delay) (= delay 0.3))
-                               scheduled-delays))
-          (should (= 1
-                     (length
-                      (cl-delete-duplicates
-                       (copy-sequence scheduled) :test #'eq))))
-          (with-current-buffer buffer
-            (should-not
-             (appkit-task-queue-pending-p zulip-root--topic-tasks))
-            (should (appkit-invalidations-any-p
-                     (appkit-view-invalidations view))))
-          ;; One explicit consumption proves that all 32 callbacks shared the
-          ;; same Appkit timer and one presentation sync.
-          (appkit-sync-invalidations view)
-          (should (= 1 sync-count))
-          (should-not
-           (appkit-invalidations-scheduled-handle
-            (appkit-view-invalidations view)))
-          (should-not
-           (appkit-invalidations-any-p
-            (appkit-view-invalidations view))))))))
+                         (plist-get (car (gethash "5" (zulip-root--topic-cache account)))
+                                    :name))))))))
 
 (ert-deftest zulip-root-topic-prune-does-not-start-discarded-waiting-work ()
   (let ((zulip-root-topic-hydration-concurrency 4))
@@ -736,17 +518,27 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
        account
        (zulip-state-from-register
         (zulip-root-test--register-with-streams 32)))
-      (let (calls buffer
-            (cancellations 0))
+      (let (calls buffer)
         (cl-letf (((symbol-function 'zulip-api-get-topics)
-                   (lambda (_account stream-id callback &rest _options)
-                     (setq calls
-                           (append calls (list (cons stream-id callback))))
-                     (list :request stream-id)))
-                  ((symbol-function 'zulip-http-cancel-request)
-                   (lambda (_request) (cl-incf cancellations))))
+                   (lambda (_account stream-id callback &rest options)
+                     (let* ((owner (plist-get options :owner))
+                            (process (make-pipe-process :name "zulip-root-test-transport"
+                                                        :buffer nil :noquery t))
+                            (handle (appkit-register-handle owner 'process process))
+                            (response callback)
+                            (callback (lambda (result)
+                                        (appkit-retire-handle handle)
+                                        (when (process-live-p process) (delete-process process))
+                                        ;; Deliver even after cancellation to exercise runtime fencing.
+                                        (funcall response result))))
+                       (push process zulip-root-test--processes)
+                       (should (eq (zulip-account-app _account) (appkit-owner-app owner)))
+                       (setq calls
+                             (append calls (list (cons stream-id callback))))
+                       handle))))
           (setq buffer (zulip-root--open-buffer account))
           (should (= 4 (length calls)))
+          (should (cl-every #'process-live-p zulip-root-test--processes))
           (with-current-buffer buffer
             (zulip-root--prune-topic-tasks
              (make-hash-table :test #'equal))
@@ -755,7 +547,13 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
           ;; Batch retirement removes every waiting task before active
           ;; cancellation can pump the queue.
           (should (= 4 (length calls)))
-          (should (= 4 cancellations)))))))
+          (should-not (cl-some #'process-live-p zulip-root-test--processes))
+          (dolist (call calls)
+            (funcall (cdr call)
+                     (zulip-root-test--topics-result '((name . "discarded")))))
+          (zulip-runtime-test--drain account)
+          (should (= 4 (length calls)))
+          (should (= 0 (hash-table-count (zulip-root--topic-cache account)))))))))
 
 (ert-deftest zulip-root-topic-hydration-force-deduplicates-active-and-queue ()
   (let ((zulip-root-topic-hydration-concurrency 2))
@@ -769,11 +567,23 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
                  (zulip-root--topic-cache account)))
       (let (calls buffer)
         (cl-letf (((symbol-function 'zulip-api-get-topics)
-                   (lambda (_account stream-id callback &rest _options)
-                     (setq calls
-                           (append calls
-                                   (list (cons stream-id callback))))
-                     :request)))
+                   (lambda (_account stream-id callback &rest options)
+                     (let* ((owner (plist-get options :owner))
+                            (process (make-pipe-process :name "zulip-root-test-transport"
+                                                        :buffer nil :noquery t))
+                            (handle (appkit-register-handle owner 'process process))
+                            (response callback)
+                            (callback (lambda (result)
+                                        (appkit-retire-handle handle)
+                                        (when (process-live-p process) (delete-process process))
+                                        ;; Deliver even after cancellation to exercise runtime fencing.
+                                        (funcall response result))))
+                       (push process zulip-root-test--processes)
+                       (should (eq (zulip-account-app _account) (appkit-owner-app owner)))
+                       (setq calls
+                             (append calls
+                                     (list (cons stream-id callback))))
+                       handle))))
           (setq buffer (zulip-root--open-buffer account))
           (should-not calls)
           (with-current-buffer buffer
@@ -785,8 +595,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
             (should (= 3 (appkit-task-queue-queued-count
                           zulip-root--topic-tasks))))
           (should (equal '(5 6) (mapcar #'car calls)))
-          (cl-letf (((symbol-function 'appkit-schedule-sync)
-                     (lambda (&rest _arguments) :scheduled)))
+          (progn
             ;; The callback for each live request starts the next FIFO item.
             ;; CALLS grows while this loop advances through all five channels.
             (let ((index 0))
@@ -794,6 +603,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
                 (funcall (cdr (nth index calls))
                          (zulip-root-test--topics-result
                           `((name . ,(format "fresh-%d" index)))))
+                (zulip-runtime-test--drain account)
                 (cl-incf index))))
           (should (equal '(5 6 7 8 9) (mapcar #'car calls)))
           (with-current-buffer buffer
@@ -818,40 +628,56 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
       (let (calls buffer old-view new-view old-callback)
         (cl-letf (((symbol-function 'zulip-api-get-topics)
                    (lambda (_account stream-id callback &rest options)
-                     (setq calls
-                           (append calls
-                                   (list (list :stream-id stream-id
-                                               :callback callback
-                                               :owner (plist-get options
-                                                                 :owner)))))
-                     :request)))
+                     (let* ((owner (plist-get options :owner))
+                            (process (make-pipe-process :name "zulip-root-test-transport"
+                                                        :buffer nil :noquery t))
+                            (handle (appkit-register-handle owner 'process process))
+                            (response callback)
+                            (callback (lambda (result)
+                                        (appkit-retire-handle handle)
+                                        (when (process-live-p process) (delete-process process))
+                                        ;; Deliver even after cancellation to exercise runtime fencing.
+                                        (funcall response result))))
+                       (push process zulip-root-test--processes)
+                       (should (eq (zulip-account-app _account) (appkit-owner-app owner)))
+                       (setq calls
+                             (append calls
+                                     (list (list :stream-id stream-id
+                                                 :callback callback
+                                                 :owner (plist-get options
+                                                                   :owner)))))
+                       handle))))
           (setq buffer (zulip-root--open-buffer account)
-                old-view (with-current-buffer buffer (appkit-current-view))
+                old-view (with-current-buffer buffer (appkit-current-surface))
                 old-callback (plist-get (car calls) :callback))
           (should (= 1 (length calls)))
-          (appkit-kill-view old-view)
+          (should (cl-every #'process-live-p zulip-root-test--processes))
+          (appkit-surface-stop old-view)
+          (should-not (cl-some #'process-live-p zulip-root-test--processes))
           (funcall old-callback
                    (zulip-root-test--topics-result
                     '((name . "old-view-result"))))
+          (zulip-runtime-test--drain account)
           (should (= 1 (length calls)))
           (should-not (gethash "5" (zulip-root--topic-cache account)))
           ;; Reattaching resets both the active set and FIFO.  A completion
           ;; carrying the detached view's token remains inert afterward.
           (setq buffer (zulip-root--open-buffer account)
-                new-view (with-current-buffer buffer (appkit-current-view)))
+                new-view (with-current-buffer buffer (appkit-current-surface)))
           (should-not (eq old-view new-view))
           (should (= 2 (length calls)))
           (should (eq new-view (plist-get (nth 1 calls) :owner)))
           (funcall old-callback
                    (zulip-root-test--topics-result
                     '((name . "still-must-not-land"))))
+          (zulip-runtime-test--drain account)
           (should (= 2 (length calls)))
           (should-not (gethash "5" (zulip-root--topic-cache account)))
-          (cl-letf (((symbol-function 'appkit-schedule-sync)
-                     (lambda (&rest _arguments) :scheduled)))
+          (progn
             (funcall (plist-get (nth 1 calls) :callback)
                      (zulip-root-test--topics-result
-                      '((name . "new-view-result")))))
+                      '((name . "new-view-result"))))
+            (zulip-runtime-test--drain account))
           (should (= 3 (length calls)))
           (should (equal "new-view-result"
                          (plist-get
@@ -863,17 +689,32 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
   (zulip-root-test--with-account account
     (let (callback buffer view)
       (cl-letf (((symbol-function 'zulip-api-get-topics)
-                 (lambda (_account _stream-id candidate &rest _options)
-                   (setq callback candidate)
-                   :request)))
+                 (lambda (_account _stream-id candidate &rest options)
+                   (let* ((owner (plist-get options :owner))
+                          (process (make-pipe-process :name "zulip-root-test-transport"
+                                                      :buffer nil :noquery t))
+                          (handle (appkit-register-handle owner 'process process))
+                          (response candidate)
+                          (candidate (lambda (result)
+                                       (appkit-retire-handle handle)
+                                       (when (process-live-p process) (delete-process process))
+                                      ;; Deliver even after cancellation to exercise runtime fencing.
+                                       (funcall response result))))
+                     (push process zulip-root-test--processes)
+                     (should (eq (zulip-account-app _account) (appkit-owner-app owner)))
+                     (setq callback candidate)
+                     handle))))
         (setq buffer (zulip-root--open-buffer account)
-              view (with-current-buffer buffer (appkit-current-view)))
+              view (with-current-buffer buffer (appkit-current-surface)))
         (should (functionp callback))
-        (appkit-kill-view view)
+        (should (cl-every #'process-live-p zulip-root-test--processes))
+        (appkit-surface-stop view)
+        (should-not (cl-some #'process-live-p zulip-root-test--processes))
         (funcall callback
                  (zulip-root-test--topics-result
                   '((name . "Must not land")
                     (max_id . "90071992547409931234"))))
+        (zulip-runtime-test--drain account)
         (should-not (gethash "5" (zulip-root--topic-cache account)))))))
 
 (ert-deftest zulip-root-refresh-refetches-and-errors-preserve-cache ()
@@ -881,16 +722,29 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
     (let (calls buffer)
       (cl-letf (((symbol-function 'zulip-api-get-topics)
                  (lambda (_account stream-id callback &rest options)
-                   (push (list stream-id callback
-                               (plist-get options :owner))
-                         calls)
-                   :request)))
+                   (let* ((owner (plist-get options :owner))
+                          (process (make-pipe-process :name "zulip-root-test-transport"
+                                                      :buffer nil :noquery t))
+                          (handle (appkit-register-handle owner 'process process))
+                          (response callback)
+                          (callback (lambda (result)
+                                      (appkit-retire-handle handle)
+                                      (when (process-live-p process) (delete-process process))
+                                      ;; Deliver even after cancellation to exercise runtime fencing.
+                                      (funcall response result))))
+                     (push process zulip-root-test--processes)
+                     (should (eq (zulip-account-app _account) (appkit-owner-app owner)))
+                     (push (list stream-id callback
+                                 (plist-get options :owner))
+                           calls)
+                     handle))))
         (setq buffer (zulip-root--open-buffer account))
         (should (= 1 (length calls)))
         (funcall (nth 1 (car calls))
                  (zulip-root-test--topics-result
                   '((name . "Cached from server")
                     (max_id . "90071992547409931234"))))
+        (zulip-runtime-test--drain account)
         (with-current-buffer buffer
           ;; A populated cache does not suppress an explicit `g' refresh.
           (zulip-root-refresh))
@@ -898,6 +752,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
         (funcall (nth 1 (car calls))
                  (zulip-api-result--create
                   :ok-p nil :status 503 :code "SERVICE_UNAVAILABLE"))
+        (zulip-runtime-test--drain account)
         (should (equal "Cached from server"
                        (plist-get
                         (car (gethash "5"

@@ -28,7 +28,7 @@ The package currently provides a complete text-message vertical slice:
   edits, optimistic sends, stable rekeying, and retryable failed rows; and
 - an optional clickable global mode-line unread/mention indicator.
 
-Zulip message IDs are opaque decimal strings at state and view boundaries.
+Zulip message IDs are opaque decimal strings at state and Surface boundaries.
 They are never converted to an Emacs number for identity or ordering.  A send
 temporarily owns a `local-*` row key; the row is promoted and rekeyed to the
 authoritative server ID when either the event or HTTP response arrives.  When
@@ -38,7 +38,7 @@ it never round-trips an ID through an Emacs number.
 
 ## Requirements
 
-emacs-zulip requires Emacs 31.1 and Appkit 0.3.0.  Markdown composition also
+emacs-zulip requires Emacs 32.0 and Appkit 0.3.0.  Markdown composition also
 requires the `markdown` and `markdown-inline` Tree-sitter grammars.  Check or
 install Appkit's pinned grammar versions explicitly:
 
@@ -50,6 +50,38 @@ install Appkit's pinned grammar versions explicitly:
 The installer is never invoked by account startup, preview, or send.  Markdown
 parsing uses Tree-sitter directly without enabling `markdown-ts-mode`, Font
 Lock, embedded code language modes, or user hooks.
+
+## Ownership and lifecycle
+
+Each normalized account is the canonical `appkit-app-model`: a
+`zulip-account` containing protocol state accessed through
+`zulip-account-state`, pending sends, topic metadata, and decoded avatar data.
+Creating an account does not perform network I/O.  Connecting explicitly starts
+an App-owned Source for registration, consecutive polling, retry, and queue
+replacement.  Source results carry the exact account, App, and generation;
+stopping or reconnecting revokes the old transport and retry capability.
+
+The root navigator and each narrow are Generated Surfaces with stable
+account-scoped identities, retrieved through `appkit-app-surface`.  App domain
+transitions post messages to those Surfaces; updates commit projection changes
+without rendering performing I/O.  Surface HTTP Effects own history, message
+actions, and editing requests.  History operations fence the current request
+and bind its returned HTTP handle to the real Surface owner, so cancellation
+and late responses cannot cross a replacement Surface or history generation.
+Optimistic sends are App-owned and can settle after their originating feed
+closes.
+
+Stopping preserves the host buffer and its editable draft while revoking the
+old Surface's authority.  Reopening reuses only an unattached, package-owned
+host with the same account and narrow identity; it preserves the derived major
+mode, structured draft, and active compose codec.  An account
+whose event Source has not been enabled is offline, not connecting.
+
+Topic hydration uses a bounded FIFO task queue owned by the root Surface;
+repeated refreshes deduplicate active and queued channels, and detached
+schedulers cannot land results or start waiting work.  Avatars are declarative
+Resources requested by dependent rows, with account-scoped decoded images and
+Appkit-managed acquisition and cancellation.
 
 ## Account configuration
 
@@ -223,22 +255,22 @@ mention counts are clickable shortcuts into the account navigator.
 ## Current limitations
 
 The Appkit 0.3.0 lifecycle, semantic markup, native UI, codec registry,
-source-backed compose capture, view ownership, sectioned directory, timeline,
-history, chat buffer, completion, responsive layout, mode-line, and avatar
-infrastructure are integrated.  Zulip's authoritative server-rendered HTML is
+source-backed compose capture, Generated Surfaces, sectioned directory,
+timeline, history, chat buffer, completion, responsive layout, mode-line, and
+avatar infrastructure are integrated.  Zulip's authoritative server-rendered HTML is
 parsed with libxml into Appkit Documents; message buffers do not use SHR.
 User/group mentions, channel/topic/message links, timestamps, spoilers, emoji,
 media, and unsupported provider structures remain typed Zulip objects with safe
 visible fallbacks.  Links and Zulip navigation become native Appkit actions.
 
-Sender avatars use an account-owned Zulip adapter over Appkit's resource
-acquisition and disk cache: rows retain stable initials geometry while loading,
-credentials are sent only to same-origin realm URLs, and completion invalidates
-only sender-dependent rows.  Remaining rich-media limitations:
+Sender avatars use declarative Appkit Resources and its disk cache: rows retain
+stable initials geometry while loading, credentials are sent only to same-origin
+realm URLs, and Resource results refresh only sender-dependent rows.
+Remaining rich-media limitations:
 
 - inline images and embeds use safe link placeholders rather than in-buffer
   image acquisition;
-- spoiler content remains visible until per-view reveal state is implemented;
+- spoiler content remains visible until per-Surface reveal state is implemented;
 - tables and unsupported provider blocks use semantic text fallbacks;
 - uploads and attachment previews are not implemented; and
 - realm/custom emoji catalogs and image-backed reaction rendering are not
@@ -249,8 +281,10 @@ These are client adapter gaps, not claims about what Appkit itself can do.
 ## Development
 
 This package is developed beside `appkit.el`.  Eask installs the package source
-and dependencies on its load path, so every ERT file directly requires the
-module it tests; there is no test-helper load-path shim.
+and dependencies on its load path.  ERT fixtures use isolated real account Apps
+and Generated Surfaces with synthetic transports; shared runtime fixtures
+deliver only their own queued App and Surface work.  They do not resolve user
+credentials or connect to a Zulip server.
 
 Install the local Appkit build, recompile, and run all tests with:
 

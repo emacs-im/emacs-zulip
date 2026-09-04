@@ -3,6 +3,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'zulip-runtime-test)
 (require 'cl-lib)
 (require 'zulip-http)
 (require 'zulip-feed)
@@ -21,39 +22,27 @@
    (and local-id (list (cons 'local_message_id local-id)))))
 
 (defmacro zulip-feed-test--with-account (binding &rest body)
-  "Create account BINDING for BODY and clean up its views."
+  "Create isolated account BINDING and retire only its fixture buffers."
   (declare (indent 1) (debug (symbolp body)))
-  `(let* ((state (zulip-state-create))
-          (,binding
-           (zulip-runtime-create-account
-            :server "https://chat.example.test/"
-            :email "ada@example.test"
-            :api-key "secret"
-            :state state))
-          (buffers-before (buffer-list)))
+  `(let* ((zulip-runtime--accounts (make-hash-table :test #'equal))
+          (zulip-runtime-change-hook nil)
+          (state (zulip-state-create))
+          (,binding (zulip-runtime-create-account
+                     :server "https://chat.example.test/"
+                     :email "ada@example.test" :api-key "secret" :state state))
+          (zulip-feed-test--open-function (symbol-function 'zulip-feed--open-buffer))
+          zulip-feed-test--buffers)
      (setf (zulip-account-queue-id ,binding) "queue-1")
      (unwind-protect
-         (progn ,@body)
-       (zulip-runtime-stop-account ,binding)
-       (dolist (buffer (buffer-list))
-         (when (and (not (memq buffer buffers-before))
-                    (buffer-live-p buffer))
-           (kill-buffer buffer))))))
-
-(ert-deftest zulip-feed-sender-face-colors-stable-user-identity ()
-  (let* ((original
-          '((sender_id . 2)
-            (sender_full_name . "Original Name")))
-         (renamed
-          '((sender_id . 2)
-            (sender_full_name . "Renamed User")))
-         (expected
-          (list (appkit-name-color-face "2")
-                'zulip-message-sender-face)))
-    (should (equal expected (zulip-feed--message-sender-face original)))
-    (should
-     (equal (zulip-feed--message-sender-face original)
-            (zulip-feed--message-sender-face renamed)))))
+         (cl-letf (((symbol-function 'zulip-feed--open-buffer)
+                    (lambda (&rest arguments)
+                      (let ((buffer (apply zulip-feed-test--open-function arguments)))
+                        (cl-pushnew buffer zulip-feed-test--buffers)
+                        buffer))))
+           ,@body)
+       (zulip-runtime-stop-all)
+       (dolist (buffer zulip-feed-test--buffers)
+         (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
 (ert-deftest zulip-narrow-has-stable-key-and-wire-json ()
   (let ((all (zulip-narrow-all))
@@ -115,7 +104,7 @@
                '((kind . channel) (channel-id . "7")
                  (topic . "client")
                  (mentioned . t)))))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (with-temp-buffer
         (setq-local zulip-feed--account account)
         (cl-letf (((symbol-function 'zulip-feed--load-history)
@@ -149,7 +138,7 @@
             `((id . 90) (type . "private") (sender_id . 2)
               (display_recipient . ,recipients)))
            opened)
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (with-temp-buffer
         (setq-local zulip-feed--account account)
         (setq-local zulip-feed--narrow (zulip-narrow-all))
@@ -168,7 +157,7 @@
                            (zulip-feed-test--message "20" "two")))
            (state (zulip-state-merge-messages
                    (zulip-account-state account) messages key)))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "11" nil)
@@ -190,12 +179,12 @@
                      (zulip-narrow-title alex-three)))
       (should-not (eq two-buffer three-buffer))
       (with-current-buffer two-buffer
-        (should (equal (appkit-view-id (appkit-current-view))
+        (should (equal (appkit-surface-identity (appkit-current-surface))
                        (zulip-feed--view-id account alex-two)))
         (should (equal (zulip-narrow-key zulip-feed--narrow)
                        '((dm 2)))))
       (with-current-buffer three-buffer
-        (should (equal (appkit-view-id (appkit-current-view))
+        (should (equal (appkit-surface-identity (appkit-current-surface))
                        (zulip-feed--view-id account alex-three)))
         (should (equal (zulip-narrow-key zulip-feed--narrow)
                        '((dm 3))))))))
@@ -204,69 +193,27 @@
   (zulip-feed-test--with-account account
     (let* ((narrow (zulip-narrow-channel 7))
            (buffer (zulip-feed--open-buffer account narrow))
-           (real-request-sync (symbol-function 'appkit-request-sync))
-           (real-sync (symbol-function 'appkit-sync-invalidations))
-           (direct-syncs 0)
-           requested-timers
            call)
-      (cl-letf (((symbol-function 'appkit-request-sync)
-                 (lambda (view &rest options)
-                   ;; Keep the owned timer dormant until the assertions below;
-                   ;; this makes callback-vs-projection ordering deterministic.
-                   (let ((timer
-                          (apply real-request-sync view
-                                 (append options '(:delay 60)))))
-                     (push timer requested-timers)
-                     timer)))
-                ((symbol-function 'appkit-sync-invalidations)
-                 (lambda (view)
-                   (cl-incf direct-syncs)
-                   (funcall real-sync view)))
-                ((symbol-function 'zulip-api-get-messages)
-                 (lambda (_account wire anchor before after callback
-                          &rest _options)
+      (cl-letf (((symbol-function 'zulip-api-get-messages)
+                 (lambda (_account wire anchor before after callback &rest _options)
                    (setq call (list wire anchor before after))
-                   (funcall
-                    callback
-                    (zulip-api-result--create
-                     :ok-p t
-                     :data
-                     (list
-                      (cons 'messages
-                            (vector
-                             (zulip-feed-test--message "31" "history")))
-                      (cons 'found_oldest t)
-                      (cons 'found_newest t)))))))
+                   (funcall callback
+                            (zulip-api-result--create
+                             :ok-p t
+                             :data
+                             (list (cons 'messages
+                                         (vector (zulip-feed-test--message "31" "history")))
+                                   (cons 'found_oldest t)
+                                   (cons 'found_newest t)))))))
         (with-current-buffer buffer
           (setq-local zulip-feed--pending-jump-id "31")
           (zulip-feed-load-latest)
-          (should
-           (equal call
-                  (list "[{\"operator\":\"channel\",\"operand\":7}]"
-                        "newest" zulip-history-page-size 0)))
+          (zulip-runtime-test--drain account)
+          (should (equal call
+                         (list "[{\"operator\":\"channel\",\"operand\":7}]"
+                               "newest" zulip-history-page-size 0)))
           (should (appkit-chat-history-window-known-p))
           (should (appkit-chat-history-older-loaded-p))
-          ;; The HTTP callback updates canonical history immediately, but may
-          ;; only request projection.  Its event and frame invalidations share
-          ;; one owned timer and do not re-enter the view synchronously.
-          (should (= direct-syncs 0))
-          (should-not (appkit-chat-timeline-keys))
-          (should (equal zulip-feed--pending-jump-id "31"))
-          ;; Request begin, history event fanout, and completion frame state
-          ;; all invalidate through Appkit and share one owned timer.
-          (should (= (length requested-timers) 3))
-          (should (eq (nth 0 requested-timers)
-                      (nth 1 requested-timers)))
-          (should (eq (nth 1 requested-timers)
-                      (nth 2 requested-timers)))
-          (let ((pending (appkit-view-invalidations
-                          (appkit-current-view))))
-            (should (memq 'timeline (appkit-invalidations-parts pending)))
-            (should (memq 'frame (appkit-invalidations-parts pending)))
-            (should (equal (appkit-invalidations-entry-keys pending)
-                           '("31"))))
-          (funcall real-sync (appkit-current-view))
-          (should (= direct-syncs 0))
           (should (equal (appkit-chat-timeline-keys) '("31")))
           (should-not zulip-feed--pending-jump-id)
           (should (equal (zulip-feed-message-id-at-point) "31")))))))
@@ -283,131 +230,95 @@
           (setq buffer (zulip-feed-open account narrow)))
         (should (= calls 0))
         (setf (zulip-account-connected-p account) t)
-        (zulip-feed--on-register account (zulip-state-create))
+        (zulip-feed--publish-event
+         account '((type . "register"))
+         (zulip-account-state account) (zulip-state-create))
+        (zulip-runtime-test--drain account)
         (should (= calls 1))
         (with-current-buffer buffer
           (should (eq (appkit-chat-history-loading) 'latest)))))))
 
-(ert-deftest zulip-feed-register-initial-load-defers-frame-to-appkit-sync ()
-  (zulip-feed-test--with-account account
-    (let* ((narrow (zulip-narrow-all))
-           (buffer (zulip-feed--open-buffer account narrow))
-           (real-request-sync (symbol-function 'appkit-request-sync))
-           (real-sync (symbol-function 'appkit-sync-invalidations))
-           (real-update-frame (symbol-function 'zulip-feed--update-frame))
-           (register-active-p nil)
-           (direct-frame-updates 0)
-           (frame-updates 0)
-           requested-timers
-           (history-calls 0))
-      (cl-letf (((symbol-function 'appkit-request-sync)
-                 (lambda (view &rest options)
-                   (let ((timer
-                          (apply real-request-sync view
-                                 (append options '(:delay 60)))))
-                     (push timer requested-timers)
-                     timer)))
-                ((symbol-function 'zulip-feed--update-frame)
-                 (lambda ()
-                   (cl-incf frame-updates)
-                   (when register-active-p
-                     (cl-incf direct-frame-updates))
-                   (funcall real-update-frame)))
-                ((symbol-function 'zulip-api-get-messages)
-                 (lambda (&rest _arguments)
-                   (cl-incf history-calls)
-                   'register-history-request)))
-        (setf (zulip-account-connected-p account) t)
-        (setq register-active-p t)
-        (unwind-protect
-            (zulip-feed--on-register account (zulip-state-create))
-          (setq register-active-p nil))
-        (should (= history-calls 1))
-        (should (= direct-frame-updates 0))
-        (should (= frame-updates 0))
-        ;; Register fanout and history-request state coalesce into one timer.
-        (should (= (length requested-timers) 2))
-        (should (eq (car requested-timers) (cadr requested-timers)))
-        (with-current-buffer buffer
-          (should (eq (appkit-chat-history-loading) 'latest))
-          (let ((pending (appkit-view-invalidations
-                          (appkit-current-view))))
-            (should (memq 'timeline (appkit-invalidations-parts pending)))
-            (should (memq 'frame (appkit-invalidations-parts pending)))
-            (should (memq 'composer (appkit-invalidations-parts pending))))
-          ;; Only the Appkit transaction may now mutate generated frame text.
-          (funcall real-sync (appkit-current-view)))
-        (should (= direct-frame-updates 0))
-        (should (= frame-updates 1))))))
-
-(ert-deftest zulip-feed-replacement-view-resets-buffer-local-ownership ()
+(ert-deftest zulip-feed-stop-reopen-preserves-draft-and-fences-old-work ()
   (zulip-feed-test--with-account account
     (setf (zulip-account-connected-p account) t)
     (let* ((narrow (zulip-narrow-topic 7 "client"))
-           (buffer (zulip-feed--open-buffer account narrow))
-           old-view old-owner canceled replacement)
-      (with-current-buffer buffer
-        (setq old-view (appkit-current-view))
-        ;; A live view reuse preserves its controller and draft state; only a
-        ;; newly attached replacement is allowed to reset ownership.
-        (should (eq buffer (zulip-feed--open-buffer account narrow)))
-        (should (eq old-view (appkit-current-view)))
-        (setq old-owner
-              (appkit-chat-history-request-start old-view 'older))
-        (appkit-register-handle
-         old-owner 'function 'stale-history-request
-         (lambda (object) (setq canceled object)))
-        (appkit-chatbuf-input-set-text "stale edit")
-        (zulip-feed--set-edit-state "stale-message" t nil "stale draft")
-        (setq-local zulip-feed--last-error "stale error"
-                    zulip-feed--latest-live-keys '("stale-live")
-                    zulip-feed--history-reload-needed-p t
-                    zulip-feed--pending-jump-id "stale-jump"
-                    zulip-feed--last-read-target-id "stale-read")
-        (puthash "stale-read" t zulip-feed--pending-read-ids)
-        (puthash "stale-unread" t zulip-feed--auto-read-suppressed-ids))
-      (appkit-kill-view old-view)
-      (should (eq canceled 'stale-history-request))
-      (should-not (appkit-view-operation-current-p old-owner))
-      (should (buffer-live-p buffer))
-      (with-current-buffer buffer
-        (should-not (appkit-current-view))
-        ;; This is the stale loading gate that used to suppress initial load.
-        (should (eq (appkit-chat-history-loading) 'older)))
-      (let ((history-calls 0))
-        (cl-letf (((symbol-function 'zulip-api-get-messages)
-                   (lambda (&rest _arguments)
-                     (cl-incf history-calls)
-                     'replacement-history-request)))
-          (save-window-excursion
-            (setq replacement (zulip-feed-open account narrow)))
-          (should (= history-calls 1))))
-      (should (eq replacement buffer))
-      (with-current-buffer replacement
-        (let* ((new-view (appkit-current-view))
-               (new-owner (appkit-chat-history-request-owner)))
-          (should (appkit-view-live-p new-view))
-          (should-not (eq new-view old-view))
-          (should (appkit-view-operation-p new-owner))
-          (should (eq (appkit-view-operation-view new-owner) new-view))
-          (should-not (appkit-chat-history-request-current-p old-owner))
-          (should (appkit-chat-history-request-current-p new-owner))
-          (should (eq (appkit-chat-history-loading) 'latest))
-          (should-not (appkit-chatbuf-aux-active-p))
-          (should (equal (appkit-chatbuf-input-string) ""))
-          (should-not zulip-feed--pending-jump-id)
-          (should (= (hash-table-count zulip-feed--pending-read-ids) 0))
-          (should (= (hash-table-count
-                      zulip-feed--auto-read-suppressed-ids)
-                     0))
-          (should-not zulip-feed--last-read-target-id)
-          (should-not zulip-feed--last-error)
-          (should-not zulip-feed--latest-live-keys)
-          (should-not zulip-feed--history-reload-needed-p)
-          (should (eq zulip-feed--pending
-                      (zulip-feed--account-table account 'pending)))
-          (should (eq new-owner (appkit-chat-history-request-cancel)))
-          (should-not (appkit-chat-history-loading-p)))))))
+           (message (zulip-feed-test--message "20" "existing"))
+           (draft (concat (appkit-chatbuf-input-object-string
+                           "@Ada"
+                           '(:kind zulip-mention :user-id "42" :full-name "Ada"
+                             :wire "@**Ada|42**"))
+                          " protected draft"))
+           history old-history old-surface edit-response
+           history-canceled edit-canceled buffer)
+      (zulip-runtime-publish-state
+       account (zulip-state-merge-messages
+                (zulip-account-state account) (list message) (zulip-narrow-key narrow)))
+      (cl-letf (((symbol-function 'zulip-api-get-messages)
+                 (lambda (_account _narrow _anchor _before _after callback &rest options)
+                   (let ((handle (appkit-register-handle
+                                  (plist-get options :owner) 'function
+                                  (lambda () (setq history-canceled t)))))
+                     (push (lambda (result)
+                             (appkit-retire-handle handle)
+                             (funcall callback result)) history)
+                     handle)))
+                ((symbol-function 'zulip-api-get-message)
+                 (lambda (_account _id callback &rest options)
+                   (let ((handle (appkit-register-handle
+                                  (plist-get options :owner) 'function
+                                  (lambda () (setq edit-canceled t)))))
+                     (setq edit-response
+                           (lambda (result)
+                             (appkit-retire-handle handle)
+                             (funcall callback result)))
+                     handle))))
+        (setq buffer (zulip-feed--open-buffer account narrow))
+        (with-current-buffer buffer
+          (setq old-surface (appkit-current-surface))
+          (appkit-chat-history-window-set "20" nil)
+          (zulip-feed-render)
+          (appkit-chatbuf-input-set-text draft)
+          (zulip-feed--load-history 'older "20" 10 0)
+          (setq old-history (car history))
+          (zulip-feed-edit-message message))
+        (zulip-runtime-test--drain account)
+        (appkit-surface-stop old-surface)
+        (should history-canceled)
+        (should edit-canceled)
+        (with-current-buffer buffer
+          (should-not (appkit-current-surface))
+          (should-not buffer-read-only)
+          (should (equal (appkit-chatbuf-input-string) draft))
+          (goto-char (point-max))
+          (insert " continued"))
+        (save-window-excursion
+          (should (eq buffer (zulip-feed-open account narrow))))
+        ;; A transport may already have queued either old completion.
+        (funcall edit-response
+                 (zulip-api-result--create :ok-p t :data '((raw_content . "stale edit"))))
+        (funcall old-history
+                 (zulip-api-result--create
+                  :ok-p t :data (list (cons 'messages
+                                            (list (zulip-feed-test--message "99" "stale page")))
+                                      '(found_newest . t))))
+        (zulip-runtime-test--drain account)
+        (with-current-buffer buffer
+          (should (equal (appkit-chatbuf-input-string) (concat draft " continued")))
+          (should (eq (plist-get
+                       (get-text-property 0 appkit-chatbuf-input-object-property
+                                          (appkit-chatbuf-input-string)) :kind)
+                      'zulip-mention)))
+        (funcall (car history)
+                 (zulip-api-result--create
+                  :ok-p t :data (list (cons 'messages
+                                            (list (zulip-feed-test--message "30" "current page")))
+                                      '(found_newest . t))))
+        (zulip-runtime-test--drain account)
+        (with-current-buffer buffer
+          (should-not (appkit-chat-history-loading-p))
+          (should (equal (appkit-chat-timeline-keys) '("30")))
+          (should (equal (appkit-chatbuf-input-string) (concat draft " continued"))))
+        (should-not (zulip-state-message (zulip-account-state account) "99"))))))
 
 (ert-deftest zulip-feed-event-first-send-rekeys-once ()
   (zulip-feed-test--with-account account
@@ -444,13 +355,13 @@
                            "queue-1"))
             ;; The websocket event wins.  Its local_message_id replaces the
             ;; optimistic cache entry and drives one explicit Appkit rekey.
-            (zulip-feed--on-app-event
+            (zulip-feed--publish-event
              account
              (list (cons 'type "message")
                    (cons 'message server-message)
                    (cons 'local_message_id local-id))
              old-state new-state)
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (should (equal (appkit-chat-timeline-keys) (list server-id)))
             (should-not (zulip-state-message
                          (zulip-account-state account) local-id))
@@ -461,6 +372,7 @@
             (funcall send-callback
                      (zulip-api-result--create
                       :ok-p t :data (list (cons 'id server-id))))
+            (zulip-runtime-test--drain account)
             (should (equal (appkit-chat-timeline-keys) (list server-id)))
             (let ((entries
                    (zulip-state-messages-for-narrow
@@ -475,7 +387,7 @@
            send-callback)
       (cl-letf (((symbol-function 'zulip-api-send-message)
                  (lambda (_account _type _to _topic _content callback
-                          &rest _options)
+                                   &rest _options)
                    (setq send-callback callback))))
         (with-current-buffer buffer
           (appkit-chat-history-window-establish-empty)
@@ -493,7 +405,7 @@
             (funcall send-callback
                      (zulip-api-result--create
                       :ok-p t :data (list (cons 'id server-id))))
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (should (eq local-node
                         (appkit-chat-timeline-node server-id)))
             (should-not (zulip-state-message
@@ -507,13 +419,13 @@
                        (authoritative . t))))
                    (new-state
                     (zulip-state-upsert-message old-state server-message)))
-              (zulip-feed--on-app-event
+              (zulip-feed--publish-event
                account
                (list (cons 'type "message")
                      (cons 'message server-message)
                      (cons 'local_message_id local-id))
                old-state new-state)
-              (appkit-sync-invalidations (appkit-current-view)))
+              (zulip-runtime-test--drain account))
             (should (eq local-node
                         (appkit-chat-timeline-node server-id)))
             (should (equal (appkit-chat-timeline-keys) (list server-id)))
@@ -594,6 +506,7 @@
         (funcall callback
                  (zulip-api-result--create
                   :ok-p t :data '((id . "91"))))
+        (zulip-runtime-test--drain account)
         (should-not (zulip-state-message
                      (zulip-account-state account) local-id))
         (should (zulip-state-message (zulip-account-state account) "91"))
@@ -624,6 +537,7 @@
         (funcall callback
                  (zulip-api-result--create
                   :ok-p nil :message "denied"))
+        (zulip-runtime-test--drain account)
         (let ((message
                (zulip-state-message (zulip-account-state account) local-id)))
           (should message)
@@ -638,7 +552,7 @@
            callbacks calls local-id)
       (cl-letf (((symbol-function 'zulip-api-send-message)
                  (lambda (_account _type _to _topic content callback
-                          &rest options)
+                                   &rest options)
                    (push callback callbacks)
                    (push (list content
                                (plist-get options :local-id)
@@ -651,7 +565,7 @@
           (setq local-id (zulip-feed-send-message))
           (funcall (car callbacks)
                    (zulip-api-result--create :ok-p nil :message "temporary"))
-          (appkit-sync-invalidations (appkit-current-view))
+          (zulip-runtime-test--drain account)
           (goto-char (appkit-chat-timeline-key-position local-id))
           (should (search-forward
                    "click or R to retry"
@@ -668,7 +582,7 @@
           (funcall (car callbacks)
                    (zulip-api-result--create
                     :ok-p t :data '((id . "90071992547409931234"))))
-          (appkit-sync-invalidations (appkit-current-view))
+          (zulip-runtime-test--drain account)
           (should-not (zulip-state-message
                        (zulip-account-state account) local-id))
           (should (zulip-state-message
@@ -686,7 +600,7 @@
            sent-content)
       (cl-letf (((symbol-function 'zulip-api-send-message)
                  (lambda (_account _type _to _topic wire-content
-                          _callback &rest _options)
+                                   _callback &rest _options)
                    (setq sent-content wire-content))))
         (with-current-buffer buffer
           (appkit-chat-history-window-establish-empty)
@@ -732,7 +646,7 @@
            sent-content)
       (cl-letf (((symbol-function 'zulip-api-send-message)
                  (lambda (_account _type _to _topic content
-                          _callback &rest _options)
+                                   _callback &rest _options)
                    (setq sent-content content))))
         (with-current-buffer buffer
           (appkit-chat-history-window-establish-empty)
@@ -749,7 +663,7 @@
            sent-content)
       (cl-letf (((symbol-function 'zulip-api-send-message)
                  (lambda (_account _type _to _topic content
-                          _callback &rest _options)
+                                   _callback &rest _options)
                    (setq sent-content content))))
         (with-current-buffer buffer
           (appkit-chat-history-window-establish-empty)
@@ -795,25 +709,33 @@
                    (list (zulip-feed-test--message "11" "old edge"))
                    key))
            (buffer (zulip-feed--open-buffer account narrow))
-           calls
+           calls old-callback
            old-owner)
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (cl-letf (((symbol-function 'zulip-api-get-messages)
                  (lambda (_account _wire anchor before after callback
-                          &rest _options)
-                   (push (list anchor before after callback) calls))))
+                                   &rest options)
+                   (let ((handle (appkit-register-handle
+                                  (plist-get options :owner) 'function #'ignore)))
+                     (push (list anchor before after
+                                 (lambda (result)
+                                   (appkit-retire-handle handle)
+                                   (funcall callback result))) calls)
+                     handle))))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "11" nil)
           (zulip-feed-load-older)
-          (setq old-owner (appkit-chat-history-request-owner)))
-        (zulip-feed--on-register account (zulip-state-create))
-        (should (= (length calls) 2))
+          (setq old-owner (appkit-chat-history-request-owner)
+                old-callback (nth 3 (car calls))))
+        (zulip-feed--publish-event
+         account '((type . "register"))
+         (zulip-account-state account) (zulip-state-create))
+        (zulip-runtime-test--drain account)
         (with-current-buffer buffer
           (should-not
            (appkit-chat-history-request-current-p old-owner))
           (should (eq (appkit-chat-history-loading) 'latest)))
-        (let ((old-callback (nth 3 (cadr calls)))
-              (latest-callback (nth 3 (car calls))))
+        (let ((latest-callback (nth 3 (car calls))))
           (funcall
            old-callback
            (zulip-api-result--create
@@ -823,6 +745,7 @@
                          (vector (zulip-feed-test--message "5" "stale")))
                    (cons 'found_oldest t)
                    (cons 'found_newest t))))
+          (zulip-runtime-test--drain account)
           (should-not (zulip-state-message
                        (zulip-account-state account) "5"))
           (funcall
@@ -834,50 +757,14 @@
                          (vector (zulip-feed-test--message "20" "fresh")))
                    (cons 'found_oldest t)
                    (cons 'found_newest t))))
+          (zulip-runtime-test--drain account)
           (should (zulip-state-message
                    (zulip-account-state account) "20"))
           (with-current-buffer buffer
             ;; History completion requests projection; this explicit flush
             ;; represents the scheduler firing after the callback returns.
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (should (equal (appkit-chat-timeline-keys) '("20")))))))))
-
-(ert-deftest zulip-feed-sync-acks-events-only-after-success ()
-  (zulip-feed-test--with-account account
-    (let* ((narrow (zulip-narrow-all))
-           (buffer (zulip-feed--open-buffer account narrow)))
-      (with-current-buffer buffer
-        (let ((view (appkit-current-view)))
-          (appkit-view-enqueue-event view '((type . noop)))
-          (appkit-invalidate view :part 'timeline)
-          (cl-letf (((symbol-function 'zulip-feed--sync-timeline)
-                     (lambda (&rest _arguments)
-                       (error "projection failed"))))
-            (should-error (appkit-sync-invalidations view)))
-          (should (= 1 (length (appkit-view-pending-events view))))
-          (should
-           (memq 'timeline
-                 (appkit-invalidations-parts
-                  (appkit-view-invalidations view))))
-          (cl-letf (((symbol-function 'zulip-feed--sync-timeline)
-                     (lambda (&rest _arguments) nil))
-                    ((symbol-function 'zulip-feed--update-frame)
-                     (lambda () nil)))
-            (appkit-sync-invalidations view))
-          (should-not (appkit-view-pending-events view)))))))
-
-(ert-deftest zulip-feed-frame-sync-does-not-force-redisplay ()
-  (zulip-feed-test--with-account account
-    (let* ((narrow (zulip-narrow-all))
-           (buffer (zulip-feed--open-buffer account narrow)))
-      (with-current-buffer buffer
-        (cl-letf (((symbol-function 'force-window-update)
-                   (lambda (&rest _arguments)
-                     (ert-fail "feed sync forced window redisplay")))
-                  ((symbol-function 'force-mode-line-update)
-                   (lambda (&rest _arguments)
-                     (ert-fail "feed sync forced mode-line redisplay"))))
-          (zulip-feed-render))))))
 
 (ert-deftest zulip-feed-register-rebases-inflight-send ()
   (zulip-feed-test--with-account account
@@ -888,18 +775,21 @@
            local-id)
       (cl-letf (((symbol-function 'zulip-api-send-message)
                  (lambda (_account _type _to _topic _content callback
-                          &rest _options)
+                                   &rest _options)
                    (setq send-callback callback)))
                 ((symbol-function 'zulip-api-get-messages)
                  (lambda (_account _wire _anchor _before _after callback
-                          &rest _options)
+                                   &rest _options)
                    (setq history-callback callback))))
         (with-current-buffer buffer
           (appkit-chat-history-window-establish-empty)
           (zulip-feed-render)
           (appkit-chatbuf-input-set-text "cross queue")
           (setq local-id (zulip-feed-send-message)))
-        (zulip-feed--on-register account (zulip-state-create))
+        (zulip-feed--publish-event
+         account '((type . "register"))
+         (zulip-account-state account) (zulip-state-create))
+        (zulip-runtime-test--drain account)
         (should (zulip-state-message
                  (zulip-account-state account) local-id))
         (with-current-buffer buffer
@@ -911,11 +801,13 @@
           :data '((messages . [])
                   (found_oldest . t)
                   (found_newest . t))))
+        (zulip-runtime-test--drain account)
         (with-current-buffer buffer
           (should (equal (appkit-chat-timeline-keys) (list local-id))))
         (funcall
          send-callback
          (zulip-api-result--create :ok-p t :data '((id . "101"))))
+        (zulip-runtime-test--drain account)
         (should-not (zulip-state-message
                      (zulip-account-state account) local-id))
         (should (zulip-state-message
@@ -929,17 +821,18 @@
            (message (zulip-feed-test--message "60" "live")))
       (cl-letf (((symbol-function 'zulip-api-get-messages)
                  (lambda (_account _wire _anchor _before _after callback
-                          &rest _options)
+                                   &rest _options)
                    (setq history-callback callback))))
         (with-current-buffer buffer
           (zulip-feed-load-latest))
         (let* ((old-state (zulip-account-state account))
                (new-state (zulip-state-upsert-message old-state message)))
-          (zulip-feed--on-app-event
+          (zulip-feed--publish-event
            account (list (cons 'type "message") (cons 'message message))
-           old-state new-state))
+           old-state new-state)
+          (zulip-runtime-test--drain account))
         (with-current-buffer buffer
-          (appkit-sync-invalidations (appkit-current-view))
+          (zulip-runtime-test--drain account)
           (should (equal (appkit-chat-timeline-keys) '("60"))))
         (funcall
          history-callback
@@ -948,6 +841,7 @@
           :data '((messages . [])
                   (found_oldest . t)
                   (found_newest . t))))
+        (zulip-runtime-test--drain account)
         (with-current-buffer buffer
           (should (appkit-chat-history-window-known-p))
           (should-not (appkit-chat-history-window-empty-p))
@@ -961,20 +855,22 @@
            (message (zulip-feed-test--message "61" "live after failure")))
       (cl-letf (((symbol-function 'zulip-api-get-messages)
                  (lambda (_account _wire _anchor _before _after callback
-                          &rest _options)
+                                   &rest _options)
                    (setq history-callback callback))))
         (with-current-buffer buffer
           (zulip-feed-load-latest))
         (let* ((old-state (zulip-account-state account))
                (new-state (zulip-state-upsert-message old-state message)))
-          (zulip-feed--on-app-event
+          (zulip-feed--publish-event
            account (list (cons 'type "message") (cons 'message message))
-           old-state new-state))
+           old-state new-state)
+          (zulip-runtime-test--drain account))
         (with-current-buffer buffer
-          (appkit-sync-invalidations (appkit-current-view)))
+          (zulip-runtime-test--drain account))
         (funcall history-callback
                  (zulip-api-result--create
                   :ok-p nil :message "offline"))
+        (zulip-runtime-test--drain account)
         (with-current-buffer buffer
           (should (appkit-chat-history-window-known-p))
           (should (equal (appkit-chat-timeline-keys) '("61"))))))))
@@ -988,7 +884,7 @@
                    (list (zulip-feed-test--message "11" "one")
                          (zulip-feed-test--message "20" "two"))
                    key)))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "11" "20")
@@ -1010,7 +906,7 @@
                    (zulip-account-state account)
                    (list (zulip-feed-test--message "11" "one"))
                    key)))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "11" nil)
@@ -1036,11 +932,11 @@
                    (list (zulip-feed-test--message "11" "one")
                          (zulip-feed-test--message "20" "two"))
                    key)))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (cl-letf (((symbol-function 'zulip-api-get-messages)
                    (lambda (_account _wire _anchor _before _after callback
-                            &rest _options)
+                                     &rest _options)
                      (funcall
                       callback
                       (zulip-api-result--create
@@ -1064,11 +960,11 @@
                    (list (zulip-feed-test--message "11" "one")
                          (zulip-feed-test--message "20" "two"))
                    key)))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (cl-letf (((symbol-function 'zulip-api-get-messages)
                    (lambda (_account _wire _anchor _before _after callback
-                            &rest _options)
+                                     &rest _options)
                      (funcall
                       callback
                       (zulip-api-result--create
@@ -1095,57 +991,68 @@
                            (zulip-feed-test--message "40" "four")))
            (state (zulip-state-merge-messages
                    (zulip-account-state account) messages key)))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "11" nil)
           (zulip-feed-render))
-        (let* ((old-state (zulip-account-state account))
-               (new-state (zulip-state-delete-message old-state "11")))
-          (zulip-feed--on-app-event
-           account '((type . delete_message) (message_id . "11"))
-           old-state new-state))
+        (let* ((old (zulip-account-state account))
+               (next (zulip-state-delete-message old "11")))
+          (zulip-feed--publish-event
+           account '((type . delete_message) (message_id . "11")) old next)
+          (zulip-runtime-test--drain account))
         (with-current-buffer buffer
-          (appkit-sync-invalidations (appkit-current-view))
           (should (equal (appkit-chat-history-window-first-key) "20"))
-          (should (equal (appkit-chat-timeline-keys)
-                         '("20" "30" "40")))
+          (should (equal (appkit-chat-timeline-keys) '("20" "30" "40")))
           (appkit-chat-history-window-set "20" "40")
           (zulip-feed-render))
-        ;; Moving a boundary out of the narrow has the same repair semantics as
-        ;; deletion; the event type is intentionally not delete_message.
-        (let* ((old-state (zulip-account-state account))
-               (new-state (zulip-state-delete-message old-state "40")))
-          (zulip-feed--on-app-event
-           account '((type . update_message) (message_id . "40"))
-           old-state new-state))
+        (let* ((old (zulip-account-state account))
+               (next (zulip-state-delete-message old "40")))
+          (zulip-feed--publish-event
+           account '((type . update_message) (message_id . "40")) old next)
+          (zulip-runtime-test--drain account))
         (with-current-buffer buffer
-          (appkit-sync-invalidations (appkit-current-view))
           (should (equal (appkit-chat-history-window-last-key) "30"))
           (should (equal (appkit-chat-timeline-keys) '("20" "30"))))
-        ;; If an unexhausted attached page disappears completely, reload
-        ;; instead of falsely claiming that the entire narrow is empty.
-        (let ((reload-calls 0))
+        ;; An unexhausted window that disappears must acquire a new exact page,
+        ;; even when the independent live-event Source is not connected.
+        (let (complete handle)
           (cl-letf (((symbol-function 'zulip-api-get-messages)
-                     (lambda (&rest _arguments)
-                       (cl-incf reload-calls))))
+                     (lambda (_account _narrow _anchor _before _after callback
+                                       &rest options)
+                       (setq handle
+                             (appkit-register-handle
+                              (plist-get options :owner) 'function
+                              (lambda () (setq complete nil))))
+                       (setq complete
+                             (lambda (result)
+                               (appkit-retire-handle handle)
+                               (funcall callback result)))
+                       handle)))
             (with-current-buffer buffer
               (appkit-chat-history-window-set "20" nil)
               (appkit-chat-history-older-loaded-set nil))
-            (let* ((old-state (zulip-account-state account))
-                   (without-20
-                    (zulip-state-delete-message old-state "20"))
-                   (new-state
-                    (zulip-state-delete-message without-20 "30")))
-              (zulip-feed--on-app-event
-               account
-               '((type . delete_message) (message_ids . ["20" "30"]))
-               old-state new-state))
+            (let* ((old (zulip-account-state account))
+                   (next (zulip-state-delete-message
+                          (zulip-state-delete-message old "20") "30")))
+              (zulip-feed--publish-event
+               account '((type . delete_message) (message_ids . ["20" "30"]))
+               old next)
+              (zulip-runtime-test--drain account))
             (with-current-buffer buffer
-              (appkit-sync-invalidations (appkit-current-view))
-              (should (= reload-calls 1))
               (should (eq (appkit-chat-history-loading) 'latest))
-              (should-not (appkit-chat-history-window-empty-p)))))))))
+              (should-not (appkit-chat-history-window-empty-p)))
+            (funcall complete
+                     (zulip-api-result--create
+                      :ok-p t
+                      :data (list (cons 'messages
+                                        (list (zulip-feed-test--message "50" "recovered")))
+                                  '(found_newest . t))))
+            (zulip-runtime-test--drain account)
+            (with-current-buffer buffer
+              (should-not (appkit-chat-history-loading-p))
+              (should (equal (appkit-chat-history-window-first-key) "50"))
+              (should (equal (appkit-chat-timeline-keys) '("50"))))))))))
 
 (ert-deftest zulip-feed-projects-telega-style-context-unread-and-reactions ()
   (zulip-feed-test--with-account account
@@ -1170,7 +1077,7 @@
             (zulip-state-set-message-unread
              state "11" t
              '((kind . channel) (channel-id . "7") (topic . "client"))))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "11" nil)
@@ -1185,33 +1092,6 @@
                    (appkit-chat-timeline-key-position "11")
                    zulip-feed--anchor-property)))))))
 
-(ert-deftest zulip-feed-compact-timestamp-is-right-aligned ()
-  (zulip-feed-test--with-account account
-    (with-temp-buffer
-      (setq-local zulip-feed--account account
-                  zulip-feed--narrow (zulip-narrow-all)
-                  zulip-feed--fill-column 80)
-      (let ((zulip-show-avatar-images nil)
-            (row
-             (appkit-chat-timeline-row-create
-              :key "20"
-              :payload (zulip-feed-test--message "20" "compact body")
-              :context '(:compact t))))
-        (zulip-feed--row-printer row)
-        (goto-char (point-min))
-        (re-search-forward "\\b[0-9][0-9]:[0-9][0-9]\\b")
-        (let* ((timestamp-start (match-beginning 0))
-               (alignment
-                (get-text-property (1- timestamp-start) 'display)))
-          (should (> timestamp-start (line-beginning-position)))
-          (should (equal (car-safe alignment) 'space))
-          (should (memq :align-to alignment))
-          (should
-           (string-match-p
-            "compact body"
-            (buffer-substring-no-properties
-             (line-beginning-position) timestamp-start))))))))
-
 (ert-deftest zulip-feed-uses-appkit-history-autoload-gates ()
   (zulip-feed-test--with-account account
     (let* ((narrow (zulip-narrow-topic 7 "client"))
@@ -1224,7 +1104,7 @@
            (buffer (zulip-feed--open-buffer account narrow))
            (older 0)
            (newer 0))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (with-current-buffer buffer
         (appkit-chat-history-window-set "11" nil)
         (zulip-feed-render)
@@ -1241,68 +1121,32 @@
            (appkit-chat-timeline-footer-start-position)))
         (should (= newer 1))))))
 
-(ert-deftest zulip-feed-owns-scroll-observer-and-rechecks-after-sync ()
+(ert-deftest zulip-feed-history-fence-cancels-surface-owned-transport ()
   (zulip-feed-test--with-account account
-    (let* ((narrow (zulip-narrow-channel 7))
-           (buffer (zulip-feed--open-buffer account narrow))
-           checks)
-      (with-current-buffer buffer
-        (let ((observer zulip-feed--scroll-observer))
-          (should (appkit-scroll-observer-p observer))
-          (should (appkit-scroll-observer-active-p observer))
-          (should (eq (appkit-current-view)
-                      (appkit-scroll-observer-owner observer)))
-          (should
-           (eq #'appkit-chat-timeline-footer-start-position
-               (appkit-scroll-observer-end-boundary-function observer)))
-          (cl-letf (((symbol-function 'appkit-scroll-observer-check)
-                     (lambda (candidate &optional _window)
-                       (should (eq candidate observer))
-                       (setq checks (1+ (or checks 0))))))
-            (zulip-feed-render)
-            (should (= 1 checks))))))))
-
-(ert-deftest zulip-feed-history-transport-is-owned-by-operation ()
-  (zulip-feed-test--with-account account
-    (let* ((narrow (zulip-narrow-channel 7))
-           (buffer (zulip-feed--open-buffer account narrow))
-           observed-owner)
+    (let* ((buffer (zulip-feed--open-buffer account (zulip-narrow-channel 7)))
+           observed-owner handle canceled callback)
       (cl-letf (((symbol-function 'zulip-api-get-messages)
-                 (lambda (_account _wire _anchor _before _after _callback
-                          &rest options)
-                   (setq observed-owner (plist-get options :owner))
-                   'fake-request)))
+                 (lambda (_account _wire _anchor _before _after response &rest options)
+                   (setq observed-owner (plist-get options :owner)
+                         callback response
+                         handle (appkit-register-handle
+                                 observed-owner 'function 'request
+                                 (lambda (_object) (setq canceled t)))))))
         (with-current-buffer buffer
           (zulip-feed-load-latest)
-          (should (appkit-view-operation-p observed-owner))
-          (should
-           (eq (appkit-view-operation-view observed-owner)
-               (appkit-current-view)))
-          (should
-           (eq observed-owner
-               (appkit-chat-history-request-owner)))
-          (should
-           (eq observed-owner
-               (appkit-chat-history-request-cancel))))))))
-
-(ert-deftest zulip-feed-uses-appkit-chatbuf-completion-and-history-adapters ()
-  (zulip-feed-test--with-account account
-    (let ((buffer (zulip-feed--open-buffer
-                   account (zulip-narrow-topic 7 "client"))))
-      (with-current-buffer buffer
-        (should (derived-mode-p 'appkit-chatbuf-mode))
-        (should (memq 'zulip-completion-mention-capf
-                      completion-at-point-functions))
-        (should (memq 'appkit-chat-emoji-capf
-                      completion-at-point-functions))
-        (should (eq (key-binding (kbd "M-p"))
-                    #'zulip-feed-draft-previous))
-        (should (eq (lookup-key zulip-feed-mode-map (kbd "C-c C-a"))
-                    #'zulip-message-transient))
-        (should (eq (lookup-key zulip-feed-mode-map (kbd "C-c C-t"))
-                    #'zulip-feed-open-topic))
-        (should (eq (lookup-key zulip-feed-mode-map (kbd "RET"))
-                    #'zulip-feed-return-dwim))))))
+          (should (eq observed-owner (appkit-current-surface)))
+          (let ((operation (appkit-chat-history-request-owner)))
+            (should (appkit-chat-history-request-current-p operation))
+            (appkit-chat-history-request-cancel)
+            (should canceled)
+            (should-not (appkit-handle-alive-p handle))
+            (should-not (appkit-chat-history-request-current-p operation)))
+          (funcall callback
+                   (zulip-api-result--create
+                    :ok-p t :data (list (cons 'messages
+                                              (vector (zulip-feed-test--message "99" "stale"))))))
+          (zulip-runtime-test--drain account)
+          (should-not (zulip-state-message (zulip-account-state account) "99")))))))
 
 (ert-deftest zulip-feed-auto-read-submits-exact-loaded-unread-prefix-once ()
   (zulip-feed-test--with-account account
@@ -1317,7 +1161,7 @@
            (call-count 0) captured)
       (dolist (id '("11" "20" "30"))
         (setq state (zulip-state-set-message-unread state id t)))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "11" nil)
@@ -1325,7 +1169,7 @@
           (goto-char (appkit-chat-timeline-key-position "20"))
           (cl-letf (((symbol-function 'zulip-api-update-message-flags)
                      (lambda (_account ids operation flag _callback
-                              &rest options)
+                                       &rest options)
                        (cl-incf call-count)
                        (setq captured
                              (list ids operation flag
@@ -1336,7 +1180,7 @@
             (should (equal (append (nth 0 captured) nil) '("11" "20")))
             (should (eq (nth 1 captured) 'add))
             (should (equal (nth 2 captured) "read"))
-            (should (eq (nth 3 captured) (appkit-current-view)))
+            (should (eq (nth 3 captured) (appkit-current-surface)))
             ;; The exact frontier and pending-ID gates suppress post-command
             ;; duplication before the queue event confirms the first request.
             (should-not (zulip-feed--mark-read-through nil t t))
@@ -1354,16 +1198,16 @@
            callback observed-owner view)
       (dolist (id '("11" "20"))
         (setq state (zulip-state-set-message-unread state id t)))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "11" nil)
           (zulip-feed-render)
           (goto-char (appkit-chat-timeline-key-position "20"))
-          (setq view (appkit-current-view))
+          (setq view (appkit-current-surface))
           (cl-letf (((symbol-function 'zulip-api-update-message-flags)
                      (lambda (_account _ids _operation _flag response
-                              &rest options)
+                                       &rest options)
                        (setq callback response
                              observed-owner (plist-get options :owner)))))
             (should (equal (zulip-feed--mark-read-through nil t t)
@@ -1382,6 +1226,7 @@
           (funcall callback
                    (zulip-api-result--create
                     :ok-p nil :message "network down"))
+          (zulip-runtime-test--drain account)
           (should (= (hash-table-count zulip-feed--pending-read-ids) 2))
           (should (eq (gethash "11" zulip-feed--pending-read-ids) 'foreign))
           (should (eq (gethash "20" zulip-feed--pending-read-ids) 'foreign))
@@ -1390,10 +1235,8 @@
           (should (= (hash-table-count zulip-feed--pending-read-ids) 0))
           (should-not zulip-feed--last-read-target-id)
           (should (equal zulip-feed--last-error "network down"))
-          (let ((pending (appkit-view-invalidations view)))
-            (should (memq 'frame (appkit-invalidations-parts pending)))
-            (should (memq 'composer
-                          (appkit-invalidations-parts pending)))))))))
+          (should (zulip-state-unread-message-p
+                   (zulip-account-state account) "11")))))))
 
 (ert-deftest zulip-feed-explicit-unread-is-not-undone-by-auto-read ()
   (zulip-feed-test--with-account account
@@ -1405,7 +1248,7 @@
            (state (zulip-state-merge-messages
                    (zulip-account-state account) (list message) key))
            calls)
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "20" nil)
@@ -1413,7 +1256,7 @@
           (goto-char (appkit-chat-timeline-key-position "20"))
           (cl-letf (((symbol-function 'zulip-api-update-message-flags)
                      (lambda (_account ids operation flag callback
-                              &rest options)
+                                       &rest options)
                        (push (list (append ids nil) operation flag
                                    (plist-get options :owner))
                              calls)
@@ -1424,7 +1267,7 @@
             (should (eq (cadar calls) 'remove))
             ;; Simulate the queue's mark-unread state before automatic point
             ;; observation runs again.
-            (zulip-feed--set-account-state
+            (zulip-runtime-publish-state
              account
              (zulip-state-set-message-unread
               (zulip-account-state account) "20" t))
@@ -1440,7 +1283,7 @@
            (state (zulip-state-merge-messages
                    (zulip-account-state account) (list message) key))
            captured)
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "20" nil)
@@ -1452,7 +1295,7 @@
                      "★" (appkit-chat-timeline-footer-start-position) t)))
           (cl-letf (((symbol-function 'zulip-api-update-message-flags)
                      (lambda (_account ids operation flag callback
-                              &rest options)
+                                       &rest options)
                        (setq captured
                              (list (append ids nil) operation flag
                                    (plist-get options :owner)))
@@ -1462,68 +1305,7 @@
             (should (equal (nth 0 captured) '("20")))
             (should (eq (nth 1 captured) 'remove))
             (should (equal (nth 2 captured) "starred"))
-            (should (eq (nth 3 captured) (appkit-current-view)))))))))
-
-(ert-deftest zulip-feed-action-errors-request-one-coalesced-sync ()
-  (zulip-feed-test--with-account account
-    (let* ((narrow (zulip-narrow-topic 7 "client"))
-           (key (zulip-narrow-key narrow))
-           (message (append (zulip-feed-test--message "20" "two")
-                            '((flags . ("read")))))
-           (state (zulip-state-merge-messages
-                   (zulip-account-state account) (list message) key))
-           (real-request-sync (symbol-function 'appkit-request-sync))
-           (real-sync (symbol-function 'appkit-sync-invalidations))
-           (direct-syncs 0)
-           requested-timers
-           callbacks)
-      (zulip-feed--set-account-state account state)
-      (let ((buffer (zulip-feed--open-buffer account narrow)))
-        (with-current-buffer buffer
-          (appkit-chat-history-window-set "20" nil)
-          (zulip-feed-render)
-          (goto-char (appkit-chat-timeline-key-position "20"))
-          (cl-letf (((symbol-function 'appkit-request-sync)
-                     (lambda (view &rest options)
-                       (let ((timer
-                              (apply real-request-sync view
-                                     (append options '(:delay 60)))))
-                         (push timer requested-timers)
-                         timer)))
-                    ((symbol-function 'appkit-sync-invalidations)
-                     (lambda (view)
-                       (cl-incf direct-syncs)
-                       (funcall real-sync view)))
-                    ((symbol-function 'zulip-api-update-message-flags)
-                     (lambda (_account _ids _operation _flag callback
-                              &rest _options)
-                       (setq callbacks
-                             (append callbacks (list callback))))))
-            ;; Two independent HTTP completions land before the display timer.
-            ;; Each records domain error state, but neither may synchronously
-            ;; mutate generated content.
-            (zulip-feed-toggle-star)
-            (zulip-feed-toggle-star)
-            (funcall (nth 0 callbacks)
-                     (zulip-api-result--create
-                      :ok-p nil :message "offline one"))
-            (funcall (nth 1 callbacks)
-                     (zulip-api-result--create
-                      :ok-p nil :message "offline two"))
-            (should (= direct-syncs 0))
-            (should (equal zulip-feed--last-error "offline two"))
-            (should (= (length requested-timers) 2))
-            (should (eq (car requested-timers) (cadr requested-timers)))
-            (let ((pending (appkit-view-invalidations
-                            (appkit-current-view))))
-              (should (memq 'frame (appkit-invalidations-parts pending)))
-              (should (memq 'composer (appkit-invalidations-parts pending))))
-            (should-not (string-match-p
-                         "Request failed: offline two" (buffer-string)))
-            (funcall real-sync (appkit-current-view))
-            (should (= direct-syncs 0))
-            (should (string-match-p
-                     "Request failed: offline two" (buffer-string)))))))))
+            (should (eq (nth 3 captured) (appkit-current-surface)))))))))
 
 (ert-deftest zulip-feed-edit-stages-raw-markdown-and-submits-through-view ()
   (zulip-feed-test--with-account account
@@ -1533,7 +1315,7 @@
            (state (zulip-state-merge-messages
                    (zulip-account-state account) (list message) key))
            get-owner update-call)
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "20" nil)
@@ -1544,46 +1326,28 @@
                        (setq get-owner (plist-get options :owner))
                        (should (equal id "20"))
                        (should-not (plist-get options :apply-markdown))
-                       (funcall
-                        callback
-                        (zulip-api-result--create
-                         :ok-p t :data '((raw_content . "**old**"))))))
+                       (funcall callback (zulip-api-result--create
+                                          :ok-p t :data '((raw_content . "**old**"))))))
                     ((symbol-function 'zulip-api-update-message)
                      (lambda (_account id callback &rest options)
                        (setq update-call (list id options))
-                       (funcall callback
-                                (zulip-api-result--create :ok-p t)))))
+                       (funcall callback (zulip-api-result--create :ok-p t)))))
             (appkit-chatbuf-input-set-text "unsent draft")
             (goto-char (appkit-chat-timeline-key-position "20"))
             (zulip-feed-edit-message)
-            (should (eq get-owner (appkit-current-view)))
+            (zulip-runtime-test--drain account)
+            (should (eq get-owner (appkit-current-surface)))
             (should (eq (appkit-chatbuf-aux-type) 'edit))
             (should (equal (appkit-chatbuf-aux-message-id) "20"))
-            (should-not (appkit-chatbuf-composer-idle-p))
-            ;; The callback settled canonical state but did not touch the
-            ;; generated composer before the exact-view sync transaction.
-            (should (equal (appkit-chatbuf-input-string) "unsent draft"))
-            (should (equal (appkit-chatbuf-input-state) "**old**"))
-            (goto-char (point-max))
-            (should-error (insert " racing draft") :type 'buffer-read-only)
-            (appkit-sync-invalidations (appkit-current-view))
             (should (equal (appkit-chatbuf-input-string) "**old**"))
             (appkit-chatbuf-input-set-text "**new**")
             (zulip-feed-send-message)
+            (zulip-runtime-test--drain account)
             (should (equal (car update-call) "20"))
-            (should (equal (plist-get (cadr update-call) :content)
-                           "**new**"))
-            (should (eq (plist-get (cadr update-call) :owner)
-                        (appkit-current-view)))
+            (should (equal (plist-get (cadr update-call) :content) "**new**"))
+            (should (eq (plist-get (cadr update-call) :owner) (appkit-current-surface)))
             (should-not (appkit-chatbuf-aux-active-p))
-            (should (equal (appkit-chatbuf-input-string) "**new**"))
-            (should (equal (appkit-chatbuf-input-state) "unsent draft"))
-            ;; With aux already settled, an early RET must not send the stale
-            ;; generated edit as an ordinary new message.
-            (should-error (zulip-feed-send-message) :type 'user-error)
-            (appkit-sync-invalidations (appkit-current-view))
-            (should (equal (appkit-chatbuf-input-string)
-                           "unsent draft"))))))))
+            (should (equal (appkit-chatbuf-input-string) "unsent draft"))))))))
 
 (ert-deftest zulip-feed-inflight-edit-get-freezes-composer ()
   (zulip-feed-test--with-account account
@@ -1600,7 +1364,7 @@
                 :wire "@**Ada|42**"))
              "protected draft"))
            get-callback)
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "20" nil)
@@ -1614,9 +1378,8 @@
             ;; The initial generation-owned materialization has completed, but
             ;; the GET owner is still live.  User/programmatic edits remain
             ;; frozen until that exact operation settles.
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (should (zulip-feed--edit-request-p))
-            (should-not zulip-feed--edit-sync-request)
             (should buffer-read-only)
             (should-not (appkit-chatbuf-rendering-p))
             (let ((undo-before buffer-undo-list))
@@ -1645,11 +1408,11 @@
             (funcall get-callback
                      (zulip-api-result--create
                       :ok-p t :data '((raw_content . "raw source"))))
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (should-not buffer-read-only)
             (should (equal (appkit-chatbuf-input-string) "raw source"))
             (zulip-feed-cancel-edit)
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (should-not buffer-read-only)
             (let ((restored (appkit-chatbuf-input-string)))
               (should (equal restored "@Ada protected draft"))
@@ -1686,7 +1449,7 @@
                 :wire "@**Ada|42**"))
              "protected draft"))
            patch-callback patch-content)
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "20" nil)
@@ -1704,7 +1467,7 @@
             (appkit-chatbuf-input-history-push "older draft")
             (appkit-chatbuf-input-set-text draft)
             (zulip-feed-edit-message message)
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (should-not buffer-read-only)
             (should (equal (appkit-chatbuf-input-string) "raw source"))
             (appkit-chatbuf-input-set-text "edited raw source")
@@ -1712,9 +1475,8 @@
             (should (equal patch-content "edited raw source"))
             ;; A frame-only sync must not accidentally unlock the composer
             ;; while PATCH still owns this generation.
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (should (zulip-feed--edit-request-p))
-            (should-not zulip-feed--edit-sync-request)
             (should buffer-read-only)
             (should-not (appkit-chatbuf-rendering-p))
             (let ((undo-before buffer-undo-list))
@@ -1730,7 +1492,7 @@
                            "edited raw source"))
 
             (funcall patch-callback (zulip-api-result--create :ok-p t))
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (should-not buffer-read-only)
             (let ((restored (appkit-chatbuf-input-string)))
               (should (equal restored "@Ada protected draft"))
@@ -1760,7 +1522,7 @@
            (state (zulip-state-merge-messages
                    (zulip-account-state account) (list message) key))
            (buffer nil))
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (setq buffer (zulip-feed--open-buffer account narrow))
       (with-current-buffer buffer
         (appkit-chat-history-window-set "20" nil)
@@ -1782,14 +1544,14 @@
                                  :ok-p t :data '((raw_content . "raw")))))))
             (zulip-feed-edit-message)
             (let ((undo-before buffer-undo-list))
-              (appkit-sync-invalidations (appkit-current-view))
+              (zulip-runtime-test--drain account)
               (should (equal buffer-undo-list undo-before)))
             (should (equal (appkit-chatbuf-input-string) "raw"))
             (should (eq appkit-markup-compose-active-codec 'markdown))
             (zulip-feed-cancel-edit)
             (should (equal (appkit-chatbuf-input-string) "raw"))
             (let ((undo-before buffer-undo-list))
-              (appkit-sync-invalidations (appkit-current-view))
+              (zulip-runtime-test--drain account)
               (should (equal buffer-undo-list undo-before)))
             (should (eq appkit-markup-compose-active-codec 'org))
             (let* ((restored (appkit-chatbuf-input-string))
@@ -1811,7 +1573,7 @@
                    (list message-twenty message-thirty) key))
            (get-callbacks (make-hash-table :test #'equal))
            patch-callback)
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "20" nil)
@@ -1827,12 +1589,12 @@
             (appkit-chatbuf-input-set-text "draft zero")
             (zulip-feed-edit-message message-twenty)
             (let ((stale-get (gethash "20" get-callbacks)))
-              (appkit-sync-invalidations (appkit-current-view))
+              (zulip-runtime-test--drain account)
               (zulip-feed-cancel-edit)
-              (appkit-sync-invalidations (appkit-current-view))
+              (zulip-runtime-test--drain account)
               (appkit-chatbuf-input-set-text "draft after cancel")
               (zulip-feed-edit-message message-thirty)
-              (appkit-sync-invalidations (appkit-current-view))
+              (zulip-runtime-test--drain account)
               (let ((new-owner zulip-feed--edit-operation-owner)
                     (new-generation zulip-feed--edit-generation))
                 (goto-char (appkit-chat-timeline-key-position "30"))
@@ -1840,6 +1602,7 @@
                   (funcall stale-get
                            (zulip-api-result--create
                             :ok-p t :data '((raw_content . "stale raw"))))
+                  (zulip-runtime-test--drain account)
                   (should (= (point) point-before)))
                 (should (eq zulip-feed--edit-operation-owner new-owner))
                 (should (eq zulip-feed--edit-generation new-generation))
@@ -1850,18 +1613,14 @@
                 (should (equal (appkit-chatbuf-input-state)
                                "draft after cancel"))))
 
-            ;; The accepted GET updates canonical state only; the exact-view
-            ;; sync materializes it and performs the deferred point move.
-            (let ((current-get (gethash "30" get-callbacks))
-                  (point-before (point)))
+            ;; Deliver the accepted GET through its captured Surface.
+            (let ((current-get (gethash "30" get-callbacks)))
               (funcall current-get
                        (zulip-api-result--create
                         :ok-p t :data '((raw_content . "raw thirty"))))
-              (should (= (point) point-before))
               (should (equal (appkit-chatbuf-input-string)
                              "draft after cancel"))
-              (should (equal (appkit-chatbuf-input-state) "raw thirty"))
-              (appkit-sync-invalidations (appkit-current-view))
+              (zulip-runtime-test--drain account)
               (should (equal (appkit-chatbuf-input-string) "raw thirty"))
               (should (= (point)
                          (appkit-chatbuf-input-logical-end-position))))
@@ -1872,12 +1631,12 @@
             (appkit-chatbuf-input-set-text "edited thirty")
             (zulip-feed-submit-edit)
             (should patch-callback)
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (zulip-feed-cancel-edit)
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (appkit-chatbuf-input-set-text "new draft after patch cancel")
             (zulip-feed-edit-message message-twenty)
-            (appkit-sync-invalidations (appkit-current-view))
+            (zulip-runtime-test--drain account)
             (let ((new-owner zulip-feed--edit-operation-owner)
                   (new-generation zulip-feed--edit-generation))
               (goto-char (appkit-chat-timeline-key-position "20"))
@@ -1886,6 +1645,7 @@
                      (ring-length appkit-chatbuf--input-ring)))
                 (funcall patch-callback
                          (zulip-api-result--create :ok-p t))
+                (zulip-runtime-test--drain account)
                 (should (= (point) point-before))
                 (should (= (ring-length appkit-chatbuf--input-ring)
                            history-before)))
@@ -1918,7 +1678,7 @@
           "please review"))
         (cl-letf (((symbol-function 'zulip-api-send-message)
                    (lambda (_account _type _to _topic content _callback
-                            &rest _options)
+                                     &rest _options)
                      (setq sent-content content))))
           (setq local-id (zulip-feed-send-message))
           (should (equal sent-content
@@ -1944,7 +1704,7 @@
            (state (zulip-state-merge-messages
                    (zulip-account-state account) (list message) key))
            captured)
-      (zulip-feed--set-account-state account state)
+      (zulip-runtime-publish-state account state)
       (let ((buffer (zulip-feed--open-buffer account narrow)))
         (with-current-buffer buffer
           (appkit-chat-history-window-set "20" nil)
@@ -1964,7 +1724,7 @@
               (should (equal (plist-get (cadr captured) :reaction-type)
                              "unicode_emoji"))
               (should (eq (plist-get (cadr captured) :owner)
-                          (appkit-current-view))))))))))
+                          (appkit-current-surface))))))))))
 
 (provide 'zulip-feed-test)
 

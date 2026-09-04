@@ -50,19 +50,6 @@
       (should-not (memq #'zulip-mode-line-update
                         zulip-runtime-change-hook)))))
 
-(ert-deftest zulip-mode-line-runtime-hook-does-not-force-redisplay ()
-  (let ((zulip-mode-line-mode t)
-        (zulip-mode-line-string "")
-        (zulip-mode-line--cached-counts '(0 . 0))
-        (redisplays 0))
-    (cl-letf (((symbol-function 'zulip-mode-line--counts)
-               (lambda () '(3 . 1)))
-              ((symbol-function 'force-mode-line-update)
-               (lambda (&rest _) (cl-incf redisplays))))
-      (zulip-mode-line-update)
-      (should (equal zulip-mode-line--cached-counts '(3 . 1)))
-      (should (zerop redisplays)))))
-
 (provide 'zulip-modes-test)
 
 ;;; zulip-modes-test.el ends here

@@ -188,14 +188,14 @@ flags apply only to the singular `message_id' anchor."
       (let ((details (and message-details
                           (zulip-state-object-get message-details id))))
         (if-let* ((message (zulip-state-message next id)))
-          (let ((flags (zulip-events--flag-list message)))
-            (setq flags
-                  (if add-p
-                      (cons flag (delete flag flags))
-                    (delete flag flags))
-                  next
-                  (zulip-state-update-message
-                   next id (list (cons 'flags flags)))))
+            (let ((flags (zulip-events--flag-list message)))
+              (setq flags
+                    (if add-p
+                        (cons flag (delete flag flags))
+                      (delete flag flags))
+                    next
+                    (zulip-state-update-message
+                     next id (list (cons 'flags flags)))))
           (when (string= flag "read")
             (setq next
                   (zulip-state-set-message-unread
@@ -309,106 +309,12 @@ flags apply only to the singular `message_id' anchor."
       ("stream" (zulip-events--stream state event))
       (_ state))))
 
-(defalias 'zulip-event-reduce #'zulip-events-reduce)
-(defalias 'zulip-state-reduce-event #'zulip-events-reduce)
-
 (defun zulip-events--active-p (account generation)
   "Return non-nil when ACCOUNT still owns GENERATION."
   (and (zulip-account-p account)
        (= generation (or (zulip-account-generation account) 0))
        (let ((app (zulip-account-app account)))
          (and (appkit-app-p app) (appkit-app-live-p app)))))
-
-(defun zulip-events--cancel-retry (account)
-  "Cancel and forget ACCOUNT's current retry timer exactly once."
-  (let ((timer (zulip-account-retry-timer account))
-        (handle (zulip-account-retry-handle account)))
-    (setf (zulip-account-retry-timer account) nil
-          (zulip-account-retry-handle account) nil)
-    (cond
-     ((and (appkit-handle-p handle) (appkit-handle-alive-p handle))
-      (appkit-cancel-handle handle))
-     ;; A dead Appkit handle has already cancelled its timer.  The raw-timer
-     ;; fallback preserves compatibility with accounts created before retry
-     ;; handles were introduced and with transport test doubles.
-     ((appkit-handle-p handle))
-     ((timerp timer) (cancel-timer timer)))))
-
-(defun zulip-events--cancel-inflight (account)
-  "Cancel ACCOUNT's current queue request and retry timer."
-  (zulip-events--cancel-retry account)
-  (when-let* ((request (zulip-account-poll-process account)))
-    (zulip-http-cancel-request request))
-  (setf (zulip-account-poll-process account) nil))
-
-(defalias 'zulip-events--install-state #'zulip-runtime-publish-state
-  "Compatibility alias for `zulip-runtime-publish-state'.")
-
-(defun zulip-events--change (account event old-state new-state)
-  "Return ACCOUNT UI change for EVENT from OLD-STATE to NEW-STATE."
-  (let* ((message (zulip-state-object-get event 'message))
-         (message-id
-          (or (and message (zulip-state-object-get message 'id))
-              (zulip-state-object-get event 'message_id)
-              (car (zulip-state--as-list
-                    (zulip-state-object-get event 'message_ids)))))
-         (local-id
-          (or (zulip-state-object-get event 'local_message_id)
-              (and message
-                   (or (zulip-state-object-get message 'local-id)
-                       (zulip-state-object-get message 'local_message_id))))))
-    (list :type (and (zulip-events--type event)
-                     (intern (zulip-events--type event)))
-          :message-id (and message-id
-                           (zulip-state-message-id message-id))
-          :local-id (and local-id (zulip-state-normalize-id local-id))
-          :account account
-          :event event
-          :old-state old-state
-          :state new-state)))
-
-(defun zulip-events--emit-event (account event old-state new-state)
-  "Publish EVENT and its OLD-STATE to NEW-STATE transition for ACCOUNT."
-  (when-let* ((app (zulip-account-app account)))
-    (appkit-app-emit app 'zulip-event account event old-state new-state)
-    (appkit-app-emit
-     app 'zulip-state-changed
-     (zulip-events--change account event old-state new-state))))
-
-(defun zulip-events--schedule-retry (account generation operation)
-  "Schedule ACCOUNT GENERATION to retry OPERATION."
-  (when (zulip-events--active-p account generation)
-    (let ((app (zulip-account-app account))
-          timer handle)
-      (zulip-events--cancel-retry account)
-      (setq
-       timer
-       (run-at-time
-        zulip-event-retry-delay nil
-        (lambda ()
-          ;; A cancelled or superseded timer may already be queued.  Only the
-          ;; account's current handle may consume the retry operation.
-          (when (and (eq timer (zulip-account-retry-timer account))
-                     (eq handle (zulip-account-retry-handle account)))
-            (setf (zulip-account-retry-timer account) nil
-                  (zulip-account-retry-handle account) nil)
-            (when (appkit-handle-p handle)
-              (appkit-cancel-handle handle))
-            (when (zulip-events--active-p account generation)
-              (funcall operation account generation))))))
-      (setq
-       handle
-       (appkit-register-handle
-        app 'timer timer
-        (lambda (owned-timer)
-          (when (eq handle (zulip-account-retry-handle account))
-            (setf (zulip-account-retry-timer account) nil
-                  (zulip-account-retry-handle account) nil))
-          (when (timerp owned-timer)
-            (cancel-timer owned-timer)))))
-      (setf (zulip-account-retry-timer account) timer
-            (zulip-account-retry-handle account) handle)
-      timer)))
 
 (defun zulip-events--result-code (result)
   "Return RESULT's stable Zulip error code."
@@ -420,137 +326,234 @@ flags apply only to the singular `message_id' anchor."
   (member (zulip-events--result-code result)
           '("BAD_EVENT_QUEUE_ID" "BAD_EVENT_QUEUE")))
 
-(defun zulip-events--track-request (account request callback-ran-p)
-  "Track REQUEST on ACCOUNT unless CALLBACK-RAN-P is non-nil."
-  (unless callback-ran-p
-    (setf (zulip-account-poll-process account) request))
-  request)
-
-(defun zulip-events--register (account generation)
-  "Register ACCOUNT's event queue for GENERATION."
-  (when (zulip-events--active-p account generation)
-    (let ((callback-ran-p nil)
-          request)
-      (setq
-       request
-       (zulip-api-register
-        account
-        (lambda (result)
-          (setq callback-ran-p t)
-          (when (zulip-events--active-p account generation)
-            (setf (zulip-account-poll-process account) nil)
-            (if (zulip-api-result-ok-p result)
-                (let* ((data (zulip-api-result-data result))
-                       (queue-id (zulip-state-object-get data 'queue_id))
-                       (last-event-id
-                        (zulip-state-object-get data 'last_event_id))
-                       (server-timeout
-                        (zulip-state-object-get
-                         data 'event_queue_longpoll_timeout_seconds))
-                       (state (zulip-state-from-register data)))
-                  (if (null queue-id)
-                      (zulip-events--schedule-retry
-                       account generation #'zulip-events--register)
-                    (setf (zulip-account-queue-id account) queue-id
-                          (zulip-account-last-event-id account) last-event-id
-                          (zulip-account-feature-level account)
-                          (zulip-state-object-get data 'zulip_feature_level)
-                          (zulip-account-server-version account)
-                          (zulip-state-object-get data 'zulip_version)
-                          (zulip-account-longpoll-timeout account)
-                          (if (and (numberp server-timeout)
-                                   (> server-timeout 0))
-                              server-timeout
-                            zulip-event-long-poll-timeout)
-                          (zulip-account-connected-p account) t)
-                    (zulip-runtime-publish-state account state)
-                    (when-let* ((app (zulip-account-app account)))
-                      (appkit-app-emit app 'zulip-register account state))
-                    (zulip-events--poll account generation)))
-              (zulip-events--schedule-retry
-               account generation #'zulip-events--register))))))
-      (zulip-events--track-request account request callback-ran-p))))
-
-(defun zulip-events--re-register (account generation)
-  "Replace ACCOUNT's invalid queue owned by GENERATION."
-  (when (zulip-events--active-p account generation)
-    (zulip-events--cancel-inflight account)
-    (let ((next-generation (1+ generation)))
-      (setf (zulip-account-generation account) next-generation
-            (zulip-account-connected-p account) nil
-            (zulip-account-queue-id account) nil
-            (zulip-account-last-event-id account) nil)
-      (zulip-events--register account next-generation))))
-
-(defun zulip-events--poll (account generation)
-  "Issue ACCOUNT's next consecutive long-poll for GENERATION."
-  (when (and (zulip-events--active-p account generation)
-             (zulip-account-queue-id account))
-    (let ((callback-ran-p nil)
-          request)
-      (setq
-       request
-       (zulip-api-get-events
-        account
-        (zulip-account-queue-id account)
-        (zulip-account-last-event-id account)
-        (lambda (result)
-          (setq callback-ran-p t)
-          (when (zulip-events--active-p account generation)
-            (setf (zulip-account-poll-process account) nil)
-            (cond
-             ((zulip-api-result-ok-p result)
-              (setf (zulip-account-connected-p account) t)
-              (let* ((data (zulip-api-result-data result))
-                     (events
-                      (zulip-state--as-list
-                       (or (zulip-state-object-get data 'events) data))))
-                (dolist (raw-event events)
-                  (let* ((event (zulip-state-normalize-object raw-event))
-                         (event-id (zulip-state-object-get event 'id))
-                         (old-state (zulip-account-state account))
-                         (new-state (zulip-events-reduce old-state event)))
-                    (when event-id
-                      (setf (zulip-account-last-event-id account) event-id))
-                    (unless (eq old-state new-state)
-                      (zulip-runtime-publish-state account new-state)
-                      (zulip-events--emit-event
-                       account event old-state new-state))))
-                (zulip-events--poll account generation)))
-             ((zulip-events--bad-queue-p result)
-              (zulip-events--re-register account generation))
-             (t
-              (setf (zulip-account-connected-p account) nil)
-              (zulip-events--schedule-retry
-               account generation #'zulip-events--poll)))))))
-      (zulip-events--track-request account request callback-ran-p))))
-
 (defun zulip-events-start (account)
-  "Start register then consecutive long-poll processing for ACCOUNT."
-  (unless (zulip-account-p account)
-    (error "Not a Zulip account: %S" account))
-  (zulip-events--cancel-inflight account)
-  (let ((generation (1+ (or (zulip-account-generation account) 0))))
-    (setf (zulip-account-generation account) generation
-          (zulip-account-queue-id account) nil
-          (zulip-account-last-event-id account) nil
-          (zulip-account-connected-p account) nil)
-    (unless (zulip-account-longpoll-timeout account)
-      (setf (zulip-account-longpoll-timeout account)
-            zulip-event-long-poll-timeout))
-    (zulip-events--register account generation)
-    account))
+  "Enable ACCOUNT's App-owned registration and consecutive poll Source."
+  (unless (and (zulip-account-p account)
+               (appkit-app-live-p (zulip-account-app account)))
+    (error "Zulip event processing requires a live account"))
+  (appkit-app-send (zulip-account-app account) '(events-start))
+  account)
 
 (defun zulip-events-stop (account)
-  "Stop ACCOUNT's event loop and invalidate all pending callbacks."
-  (when (zulip-account-p account)
-    (setf (zulip-account-generation account)
-          (1+ (or (zulip-account-generation account) 0)))
-    (zulip-events--cancel-inflight account)
-    (setf (zulip-account-connected-p account) nil
-          (zulip-account-queue-id account) nil
-          (zulip-account-last-event-id account) nil)
-    t))
+  "Revoke ACCOUNT's exact Source epoch and its transport/retry capability."
+  (when (and (zulip-account-p account)
+             (appkit-app-live-p (zulip-account-app account)))
+    (appkit-app-send (zulip-account-app account) '(events-stop))))
+
+(cl-defstruct (zulip-events--transport
+               (:constructor zulip-events--transport-create))
+  account app generation emit request request-token timer active-p)
+
+(defun zulip-events--transport-current-p (transport)
+  "Test the exact App, account, and epoch captured by TRANSPORT."
+  (let ((account (zulip-events--transport-account transport)))
+    (and (zulip-events--transport-active-p transport)
+         (eq (zulip-events--transport-app transport) (zulip-account-app account))
+         (eq transport (zulip-account-event-transport account))
+         (zulip-events--active-p
+          account (zulip-events--transport-generation transport)))))
+
+(defun zulip-events--transport-cancel (transport)
+  "Revoke TRANSPORT before cancelling its actual process and retry timer."
+  (setf (zulip-events--transport-active-p transport) nil
+        (zulip-events--transport-request-token transport) nil)
+  (when-let* ((timer (zulip-events--transport-timer transport)))
+    (cancel-timer timer))
+  (when-let* ((request (zulip-events--transport-request transport)))
+    (zulip-http-cancel-request request))
+  (let ((account (zulip-events--transport-account transport)))
+    (when (eq transport (zulip-account-event-transport account))
+      (setf (zulip-account-event-transport account) nil
+            (zulip-account-poll-process account) nil
+            (zulip-account-retry-timer account) nil
+            (zulip-account-retry-handle account) nil)))
+  (setf (zulip-events--transport-request transport) nil
+        (zulip-events--transport-timer transport) nil))
+
+(defun zulip-events--request (transport operation)
+  "Start one exact OPERATION, emitting only its first current response."
+  (when (zulip-events--transport-current-p transport)
+    (let* ((account (zulip-events--transport-account transport))
+           (zulip-http--source-request-p t)
+           (token (make-symbol "zulip-queue-request-"))
+           (completed nil)
+           (_ (setf (zulip-events--transport-request-token transport) token))
+           (callback
+            (lambda (result)
+              (when (and (not completed)
+                         (eq token (zulip-events--transport-request-token transport))
+                         (zulip-events--transport-current-p transport))
+                (setq completed t)
+                (setf (zulip-events--transport-request-token transport) nil
+                      (zulip-events--transport-request transport) nil
+                      (zulip-account-poll-process account) nil)
+                (funcall (zulip-events--transport-emit transport) operation result))))
+           (request
+             (pcase operation
+               ('register (zulip-api-register account callback))
+               ('poll
+                (zulip-api-get-events account
+                                      (zulip-account-queue-id account)
+                                      (zulip-account-last-event-id account) callback))
+               (_ (error "Unknown Zulip queue operation: %S" operation)))))
+      (unless (or completed (processp request) (appkit-handle-p request))
+        (error "Zulip Source returned no pending transport capability"))
+      (unless completed
+        (setf (zulip-events--transport-request transport) request
+              (zulip-account-poll-process account) request))
+      request)))
+
+(defun zulip-events--source-start (_context input emit _closed)
+  "Start one real register/poll transport after the account App is linked."
+  (pcase-let ((`(,account ,app ,generation) input))
+    (unless (and (eq app (zulip-account-app account))
+                 (zulip-events--active-p account generation))
+      (error "Zulip Source started with a stale account"))
+    (let ((transport
+           (zulip-events--transport-create
+            :account account :app app :generation generation
+            :emit emit :active-p t)))
+      (setf (zulip-account-event-transport account) transport)
+      (condition-case condition
+          (zulip-events--request transport 'register)
+        (error
+         (zulip-events--transport-cancel transport)
+         (signal (car condition) (cdr condition))))
+      (appkit-source-cancellation-create
+       :kind 'transport
+       :cancel (lambda () (zulip-events--transport-cancel transport))))))
+
+(defun zulip-events--source-outbound (_context input payload _complete)
+  "Run committed queue OPERATION in PAYLOAD, preserving the existing delay."
+  (pcase-let* ((`(,account ,app ,generation) input)
+               (`(,operation ,retry-p) payload)
+               (transport (zulip-account-event-transport account)))
+    (if (not (and transport (eq app (zulip-account-app account))
+                  (= generation (zulip-account-generation account))
+                  (zulip-events--transport-current-p transport)))
+        'stale
+      (if retry-p
+          (let (timer)
+            (setq timer
+                  (run-at-time
+                   zulip-event-retry-delay nil
+                   (lambda ()
+                     (when (and (zulip-events--transport-current-p transport)
+                                (eq timer (zulip-events--transport-timer transport)))
+                       (setf (zulip-events--transport-timer transport) nil
+                             (zulip-account-retry-timer account) nil)
+                       (zulip-events--request transport operation)))))
+            (setf (zulip-events--transport-timer transport) timer
+                  (zulip-account-retry-timer account) timer))
+        (zulip-events--request transport operation))
+      'accepted)))
+
+(defun zulip-events--source (account)
+  "Declare ACCOUNT's current exact protocol epoch as an App Source."
+  (appkit-source-spec-create
+   :key 'zulip-events :identity (zulip-account-generation account)
+   :input (list account (zulip-account-app account)
+                (zulip-account-generation account))
+   :start #'zulip-events--source-start
+   :event (lambda (input operation result)
+            (list 'events-result input operation result))
+   :closed (lambda (input reason) (list 'events-closed input reason))
+   :outbound #'zulip-events--source-outbound :outbound-pending-limit 1
+   :emission-policy 'lossless :pending-limit 64
+   :cancellation-requirement 'transport))
+
+(defun zulip-events--intent-result (_payload outcome)
+  "Return a protocol delivery outcome from the exact Source adapter."
+  (list 'events-intent outcome))
+
+(defun zulip-events--continue (account operation &optional retry-p)
+  "Stage OPERATION after ACCOUNT's accepted state transition."
+  (push (appkit-command-source-intent
+         :key 'zulip-events :expected-identity (zulip-account-generation account)
+         :payload (list operation retry-p)
+         :result-mapper #'zulip-events--intent-result)
+        zulip-runtime--commands))
+
+(defun zulip-events--update (account message)
+  "Commit Source MESSAGE into ACCOUNT and stage its next queue operation."
+  (pcase message
+    ((or '(events-start) '(events-stop))
+     (zulip-events--begin-epoch account (eq (car message) 'events-start)))
+    (`(events-result (,captured ,app ,generation) ,operation ,result)
+     (when (and (eq captured account) (eq app (zulip-account-app account))
+                (= generation (zulip-account-generation account))
+                (zulip-account-events-enabled-p account))
+       (pcase operation
+         ('register
+          (if (not (zulip-api-result-ok-p result))
+              (zulip-events--continue account 'register t)
+            (let* ((data (zulip-api-result-data result))
+                   (queue-id (zulip-state-object-get data 'queue_id))
+                   (timeout (zulip-state-object-get
+                             data 'event_queue_longpoll_timeout_seconds)))
+              (if (null queue-id)
+                  (zulip-events--continue account 'register t)
+                (let* ((old (zulip-account-state account))
+                       (state (zulip-state-from-register data)))
+                  (when (fboundp 'zulip-feed--rebase-pending)
+                    (setq state (zulip-feed--rebase-pending account state)))
+                  (setf (zulip-account-queue-id account) queue-id
+                        (zulip-account-last-event-id account)
+                        (zulip-state-object-get data 'last_event_id)
+                        (zulip-account-feature-level account)
+                        (zulip-state-object-get data 'zulip_feature_level)
+                        (zulip-account-server-version account)
+                        (zulip-state-object-get data 'zulip_version)
+                        (zulip-account-longpoll-timeout account)
+                        (if (and (numberp timeout) (> timeout 0))
+                            timeout zulip-event-long-poll-timeout)
+                        (zulip-account-connected-p account) t)
+                  (zulip-runtime-publish-state account state)
+                  (zulip-runtime--fanout account '((type . "register")) old state)
+                  (zulip-events--continue account 'poll))))))
+         ('poll
+          (cond
+           ((zulip-api-result-ok-p result)
+            (setf (zulip-account-connected-p account) t)
+            (let* ((data (zulip-api-result-data result))
+                   (old (zulip-account-state account))
+                   (state old)
+                   accepted)
+              (dolist (raw (zulip-state--as-list
+                            (or (zulip-state-object-get data 'events) data)))
+                (let* ((event (zulip-state-normalize-object raw))
+                       (id (zulip-state-object-get event 'id))
+                       (next (zulip-events-reduce state event)))
+                  (when id (setf (zulip-account-last-event-id account) id))
+                  (unless (eq state next)
+                    (push event accepted)
+                    (setq state next))))
+              (unless (eq old state)
+                (zulip-runtime-publish-state account state)
+                (zulip-runtime--fanout
+                 account (list (cons 'type "event_batch")
+                               (cons 'events (nreverse accepted))) old state)))
+            (zulip-events--continue account 'poll))
+           ((zulip-events--bad-queue-p result)
+            (zulip-events--begin-epoch account t))
+           (t
+            (setf (zulip-account-connected-p account) nil)
+            (zulip-events--continue account 'poll t)))))))
+    (`(events-closed (,captured ,app ,generation) ,_reason)
+     (when (and (eq captured account) (eq app (zulip-account-app account))
+                (= generation (zulip-account-generation account)))
+       (setf (zulip-account-connected-p account) nil
+             (zulip-account-events-enabled-p account) nil)))))
+
+(defun zulip-events--begin-epoch (account enabled)
+  "Revoke protocol-dependent work before changing ACCOUNT's Source epoch."
+  (cl-incf (zulip-account-generation account))
+  (setf (zulip-account-events-enabled-p account) enabled
+        (zulip-account-connected-p account) nil
+        (zulip-account-queue-id account) nil
+        (zulip-account-last-event-id account) nil)
+  (zulip-runtime--fanout account '((type . epoch))
+                         (zulip-account-state account) (zulip-account-state account)))
 
 (provide 'zulip-events)
 
