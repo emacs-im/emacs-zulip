@@ -31,7 +31,7 @@
 (require 'appkit-markup)
 (require 'appkit-markup-ui)
 (require 'appkit-markup-compose)
-(require 'appkit-view)
+(require 'appkit-presentation)
 (require 'zulip-customize)
 (require 'zulip-completion)
 (require 'zulip-runtime)
