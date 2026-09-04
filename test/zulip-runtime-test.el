@@ -64,7 +64,7 @@
 (ert-deftest zulip-runtime-startup-failure-erases-owned-api-key ()
   (zulip-runtime-test--isolated
     (let (owned-key)
-      (cl-letf (((symbol-function 'appkit-start-app)
+      (cl-letf (((symbol-function 'appkit-app-start)
                  (lambda (_kind &rest options)
                    (setq owned-key
                          (zulip-account-api-key
