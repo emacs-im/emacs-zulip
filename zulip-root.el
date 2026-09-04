@@ -19,7 +19,7 @@
 (require 'appkit-invalidation)
 (require 'appkit-task-queue)
 (require 'appkit-ui)
-(require 'appkit-view)
+(require 'appkit-presentation)
 (require 'zulip-api)
 (require 'zulip-customize)
 (require 'zulip-feed)
@@ -722,8 +722,8 @@ The authenticated user remains present for a self-DM."
          (mentions (or (zulip-root--entry-mention-count entry) 0))
          (muted-p (zulip-root--entry-muted-p entry))
          (help (format "Open %s" (zulip-root--entry-title entry))))
-    (appkit-view-insert-one-line-row
-     (appkit-view-one-line-row-create
+    (appkit-presentation-insert-one-line-row
+     (appkit-presentation-one-line-row-create
       :icon-inserter (lambda () (insert (zulip-root--row-icon type)))
       :context (zulip-root--entry-title entry)
       :context-trail (zulip-root--trail unread mentions muted-p)
@@ -748,13 +748,13 @@ The authenticated user remains present for a self-DM."
   "Insert one persistent root ENTRY."
   (pcase (zulip-root--entry-type entry)
     ('summary
-     (appkit-view-insert-note-line
+     (appkit-presentation-insert-note-line
       (zulip-root--entry-title entry) :face 'font-lock-doc-face))
     ('heading
-     (appkit-view-insert-heading-line
+     (appkit-presentation-insert-heading-line
       (zulip-root--entry-title entry) :face 'bold))
     ('note
-     (appkit-view-insert-note-line (zulip-root--entry-title entry)))
+     (appkit-presentation-insert-note-line (zulip-root--entry-title entry)))
     ((or 'all 'mentioned 'starred 'channel 'topic 'dm)
      (zulip-root--insert-action-entry entry))
     (type (error "Unknown Zulip root entry type: %S" type))))
