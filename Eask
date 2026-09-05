@@ -4,7 +4,7 @@
          "0.1.0"
          "Appkit-based Zulip client")
 
-(website-url "https://github.com/0WD0/emacs-zulip")
+(website-url "https://github.com/emacs-im/emacs-zulip")
 (keywords "comm")
 
 (package-file "zulip.el")

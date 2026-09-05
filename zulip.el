@@ -3,7 +3,7 @@
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "32.0") (appkit "0.3.0") (plz "0.8") (transient "0.7"))
 ;; Keywords: comm
-;; URL: https://github.com/0WD0/emacs-zulip
+;; URL: https://github.com/emacs-im/emacs-zulip
 
 ;;; Commentary:
 
