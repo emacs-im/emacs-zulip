@@ -161,8 +161,6 @@ Names and normalized server/email identities must both be unique."
        (plist-get spec :port)))
     (copy-sequence secret)))
 
-
-
 (provide 'zulip-auth)
 
 ;;; zulip-auth.el ends here

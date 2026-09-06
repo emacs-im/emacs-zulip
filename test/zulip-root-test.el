@@ -94,7 +94,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
                              (_callback (lambda (result)
                                           (appkit-retire-handle handle)
                                           (when (process-live-p process) (delete-process process))
-                                         ;; Deliver even after cancellation to exercise runtime fencing.
+                                          ;; Deliver even after cancellation to exercise runtime fencing.
                                           (funcall response result))))
                         (push process zulip-root-test--processes)
                         (should (eq (zulip-account-app _account) (appkit-owner-app owner)))
@@ -698,7 +698,7 @@ TOPIC, STREAM-ID, and DISPLAY-RECIPIENT describe channel or direct context."
                           (candidate (lambda (result)
                                        (appkit-retire-handle handle)
                                        (when (process-live-p process) (delete-process process))
-                                      ;; Deliver even after cancellation to exercise runtime fencing.
+                                       ;; Deliver even after cancellation to exercise runtime fencing.
                                        (funcall response result))))
                      (push process zulip-root-test--processes)
                      (should (eq (zulip-account-app _account) (appkit-owner-app owner)))

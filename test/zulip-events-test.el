@@ -746,7 +746,7 @@
         (zulip-runtime-test--drain account)
         (should (= calls 2))
         (should-not (zulip-account-retry-timer account))
-       ;; Redelivery of the retired retry cannot start another registration.
+        ;; Redelivery of the retired retry cannot start another registration.
         (apply (timer--function timer) (timer--args timer))
         (zulip-runtime-test--drain account)
         (should (= calls 2))

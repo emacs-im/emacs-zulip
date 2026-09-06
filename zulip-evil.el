@@ -60,7 +60,6 @@ When nil, leave Evil's initial-state selection untouched."
   '(zulip-root-mode zulip-feed-mode)
   "Major modes participating in emacs-zulip's Evil integration.")
 
-
 (defun zulip-evil--define-root-keys ()
   "Install navigator bindings without replacing native Evil prefixes."
   (appkit-evil-define-readonly-keys 'zulip-root-mode-map)

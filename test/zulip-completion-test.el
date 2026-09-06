@@ -33,8 +33,8 @@ ACTIVE equal to `missing' omits `is_active'."
   "Run BODY with an isolated account candidate cache."
   (declare (indent 0) (debug t))
   `(zulip-runtime-test--isolated
-    (let ((zulip-completion--account-cache (make-hash-table :test #'eq)))
-      ,@body)))
+     (let ((zulip-completion--account-cache (make-hash-table :test #'eq)))
+       ,@body)))
 
 (ert-deftest zulip-completion-builds-active-mention-candidates-without-secret ()
   (zulip-completion-test--with-cache

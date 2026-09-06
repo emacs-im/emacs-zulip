@@ -438,7 +438,7 @@
             (should-not (process-live-p process))
             (should-not (appkit-handle-alive-p handle))
             (should-not (appkit-surface-handles view))
-           ;; A completion queued before cancellation remains harmless.
+            ;; A completion queued before cancellation remains harmless.
             (funcall then
                      (zulip-api-test--response
                       200 "{\"result\":\"success\"}"))

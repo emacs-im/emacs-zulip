@@ -154,7 +154,6 @@ COLLISION-P and SEEN determine its unique visible label."
              (when email
                (list 'help-echo (format "%s · Zulip user %s" email id)))))))
 
-
 (defun zulip-completion-markup-object-printer (node)
   "Return exact Zulip Markdown for semantic composer object NODE.
 

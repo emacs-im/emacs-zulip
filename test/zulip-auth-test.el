@@ -8,7 +8,6 @@
 (require 'zulip-auth)
 (require 'zulip)
 
-
 (ert-deftest zulip-auth-configured-targets-normalize-origin-and-service ()
   (let ((zulip-accounts
          '((:name " Work "
@@ -41,25 +40,25 @@
   (dolist
       (accounts
        '(((:name "work" :server "http://chat.example.com"
-          :email "me@example.com"))
+           :email "me@example.com"))
          ((:name "work" :server "https://chat.example.com/path"
-          :email "me@example.com"))
+           :email "me@example.com"))
          ((:name "work" :server "https://chat.example.com?token=value"
-          :email "me@example.com"))
+           :email "me@example.com"))
          ((:name "work" :server "https://user@chat.example.com"
-          :email "me@example.com"))
+           :email "me@example.com"))
          ((:name "work" :name "duplicate"
-          :server "https://chat.example.com" :email "me@example.com"))
+           :server "https://chat.example.com" :email "me@example.com"))
          ((:name "work" :server "https://chat.example.com"
-          :email "me@example.com" :api-key "must-not-live-here"))
+           :email "me@example.com" :api-key "must-not-live-here"))
          ((:name "work" :server "https://chat.example.com"
-          :email "me@example.com")
+           :email "me@example.com")
           (:name "WORK" :server "https://other.example.com"
-          :email "other@example.com"))
+           :email "other@example.com"))
          ((:name "one" :server "https://chat.example.com"
-          :email "me@example.com")
+           :email "me@example.com")
           (:name "two" :server "https://CHAT.example.com/"
-          :email "ME@example.com"))))
+           :email "ME@example.com"))))
     (let ((zulip-accounts accounts))
       (should-error (zulip-auth-configured-targets) :type 'user-error))))
 
@@ -147,7 +146,6 @@
      (eq (zulip--connect-or-reuse
           "https://chat.example.com" "me@example.com" nil)
          'live-account))))
-
 
 (ert-deftest zulip-default-entry-selects-configured-auth-source-target ()
   (let ((zulip-accounts

@@ -249,9 +249,9 @@ Return DEFAULT when no accepted variant of KEY is present."
 (defun zulip-state--message-kind (message)
   "Return canonical `channel' or `direct' kind for MESSAGE."
   (let ((type (downcase (format "%s"
-                               (or (zulip-state-object-get message 'kind)
-                                   (zulip-state-object-get message 'type)
-                                   "")))))
+                                (or (zulip-state-object-get message 'kind)
+                                    (zulip-state-object-get message 'type)
+                                    "")))))
     (cond ((member type '("stream" "channel")) 'channel)
           ((member type '("private" "direct" "dm")) 'direct)
           (t nil))))
@@ -571,7 +571,7 @@ DETAILS is the optional `message_details' object from a mark-unread event."
                      (zulip-state-object-get context 'participant-ids)))
           (zulip-state--touch-dm-conversation!
            next participants id)))
-    next)))
+      next)))
 
 (defun zulip-state-sync-message-flags (state message-id flags
                                              &optional details)
@@ -755,8 +755,8 @@ When CACHED-P is non-nil, MESSAGE-ID is also part of the local message cache."
       ("topic"
        (zulip-state--string-equal-ignore-case
         (format "%s" (or (zulip-state-object-get message 'topic)
-                           (zulip-state-object-get message 'subject)
-                           ""))
+                         (zulip-state-object-get message 'subject)
+                         ""))
         (format "%s" operand)))
       ("sender"
        (or (equal (format "%s" (zulip-state-object-get message 'sender_id))
@@ -771,14 +771,14 @@ When CACHED-P is non-nil, MESSAGE-ID is also part of the local message cache."
                  (zulip-state--direct-narrow-ids state message)
                  (zulip-state--narrow-dm-operands operand)))))
       ("id" (equal (zulip-state-message-id message)
-                    (zulip-state-normalize-id operand)))
+                   (zulip-state-normalize-id operand)))
       ("is"
        (pcase (downcase (format "%s" operand))
          ((or "dm" "private") (eq kind 'direct))
          ("starred" (member "starred" (zulip-state--flags message)))
          ("mentioned" (or (member "mentioned" (zulip-state--flags message))
-                           (member "wildcard_mentioned"
-                                   (zulip-state--flags message))))
+                          (member "wildcard_mentioned"
+                                  (zulip-state--flags message))))
          (_ 'unknown)))
       (_ 'unknown))))
 
@@ -1059,10 +1059,10 @@ the corresponding `local-*' placeholder in every index."
                         `((kind . direct)
                           (participant-ids
                            . ,(delq nil
-                                   (list (zulip-state-self-user-id state)
-                                         (and other-id
-                                              (zulip-state-normalize-id
-                                               other-id)))))))))
+                                    (list (zulip-state-self-user-id state)
+                                          (and other-id
+                                               (zulip-state-normalize-id
+                                                other-id)))))))))
           ;; Legacy servers exposed bare PM message IDs.
           (record group nil)))
       (dolist (group (zulip-state--as-list

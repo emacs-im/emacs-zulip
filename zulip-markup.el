@@ -27,13 +27,13 @@
 
 (defconst zulip-markup--discard-tags
   '(script style head iframe frame frameset object embed form input textarea
-           select option button video audio source track canvas svg math link
-           meta base template noscript)
+    select option button video audio source track canvas svg math link
+    meta base template noscript)
   "HTML elements whose complete subtrees are not message content.")
 
 (defconst zulip-markup--block-tags
   '(address article aside blockquote div dl fieldset figure figcaption footer
-            h1 h2 h3 h4 h5 h6 header hr li main nav ol p pre section table ul)
+    h1 h2 h3 h4 h5 h6 header hr li main nav ol p pre section table ul)
   "Elements that establish block boundaries in rendered Zulip HTML.")
 
 (cl-defstruct (zulip-markup-provider-object
@@ -459,10 +459,10 @@ Reject traversal deeper than `zulip-markup-max-depth'."
   (let (blocks pending-inline)
     (cl-labels
         ((flush-inline
-          ()
-          (when pending-inline
-            (push (appkit-markup-paragraph pending-inline) blocks)
-            (setq pending-inline nil))))
+           ()
+           (when pending-inline
+             (push (appkit-markup-paragraph pending-inline) blocks)
+             (setq pending-inline nil))))
       (dolist (node nodes)
         (zulip-markup--tick depth)
         (cond
@@ -524,7 +524,7 @@ Reject traversal deeper than `zulip-markup-max-depth'."
                      ("&gt;" . ">") ("&quot;" . "\"") ("&#39;" . "'")
                      ("&apos;" . "'") ("&hellip;" . "…")
                      ("&mdash;" . "—") ("&ndash;" . "–"))
-           text)
+                   text)
     (setq text (replace-regexp-in-string
                 (regexp-quote (car mapping)) (cdr mapping) text t t))))
 
