@@ -2612,7 +2612,6 @@ Account-owned optimistic sends remain in their shared domain table."
   (setq-local appkit-chatbuf-input-sync-function
               #'appkit-chatbuf-input-state-sync)
   (setq-local buffer-read-only nil)
-  (setq-local truncate-lines nil)
   (setq-local header-line-format '(:eval (zulip-feed--header-line)))
   (appkit-compose-setup
    :snapshot-function #'appkit-chatbuf-input-state
