@@ -1,6 +1,7 @@
 ;;; zulip-markup-test.el --- Zulip semantic markup tests -*- lexical-binding: t; -*-
 
 (require 'ert)
+(require 'appkit-markup-ui)
 (require 'zulip-runtime-test)
 (require 'cl-lib)
 (require 'appkit-markup-ui)
@@ -148,7 +149,12 @@
      (equal
       (zulip-markup-plain-text
        "<p>&#65; &#x41; &#dead; &#0; &#xD800; &#x110000;</p>")
-      "A A &#dead; � � �"))))
+      "A A &#dead; � � �"))
+    (with-temp-buffer
+      (appkit-markup-ui-insert-document
+       (zulip-markup-parse "<p>one<br>two<br><br>three</p>") :final-newline-p nil)
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "one\ntwo\n\nthree")))))
 
 (ert-deftest zulip-feed-row-owns-anchor-around-native-markup-properties ()
   (zulip-runtime-test--isolated

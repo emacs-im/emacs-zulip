@@ -555,12 +555,14 @@ Reject traversal deeper than `zulip-markup-max-depth'."
     (string-trim text)))
 
 (defun zulip-markup--plain-document (text)
-  "Return a semantic document for fallback plain TEXT."
+  "Return a literal document for fallback plain TEXT, preserving line breaks."
   (appkit-markup-document
-   (mapcar
-    (lambda (line)
-      (appkit-markup-paragraph (list (appkit-markup-text line))))
-    (split-string text "\n" t))))
+   (list
+    (appkit-markup-paragraph
+     (cl-loop for line in (split-string text "\n" nil)
+              for first = t then nil
+              unless first collect (appkit-markup-line-break)
+              collect (appkit-markup-text line))))))
 
 (defun zulip-markup-parse (html &optional base-url)
   "Return an Appkit document adapted from Zulip rendered HTML.
