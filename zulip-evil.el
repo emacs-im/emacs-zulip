@@ -9,34 +9,8 @@
 
 ;;; Code:
 
-(defvar zulip-feed-mode-map)
-
 (require 'appkit-evil)
-(require 'zulip-customize)
-
-(declare-function zulip-feed-cancel-edit "zulip-feed" ())
-(declare-function zulip-feed-copy-message "zulip-feed" (&optional message))
-(declare-function zulip-feed-delete-message "zulip-feed" (&optional message))
-(declare-function zulip-feed-edit-message "zulip-feed" (&optional message))
-(declare-function zulip-feed-load-latest "zulip-feed" ())
-(declare-function zulip-feed-load-newer "zulip-feed" ())
-(declare-function zulip-feed-load-older "zulip-feed" ())
-(declare-function zulip-feed-mark-read "zulip-feed" (&optional position))
-(declare-function zulip-feed-mark-unread "zulip-feed" (&optional message))
-(declare-function zulip-feed-open-message-context "zulip-feed" (&optional message))
-(declare-function zulip-feed-open-topic "zulip-feed" (&optional channel topic))
-(declare-function zulip-feed-retry-send "zulip-feed" (&optional message))
-(declare-function zulip-feed-toggle-reaction "zulip-feed" (&optional reaction message-id))
-(declare-function zulip-feed-toggle-star "zulip-feed" (&optional message))
-(declare-function zulip-message-transient "zulip-transient" (&rest arguments))
-(declare-function zulip-root-next-mentioned "zulip-root" ())
-(declare-function zulip-root-next-unread "zulip-root" ())
-(declare-function zulip-root-open-at-point "zulip-root" ())
-(declare-function zulip-root-open-destination "zulip-root" ())
-(declare-function zulip-root-open-new-direct-message "zulip-root" ())
-(declare-function zulip-root-open-topic "zulip-root" ())
-(declare-function zulip-root-refresh "zulip-root" ())
-(declare-function zulip-root-search-messages "zulip-root" (&optional query))
+(require 'zulip)
 
 (defgroup zulip-evil nil
   "Optional native Evil integration for emacs-zulip."

@@ -26,7 +26,6 @@
 (require 'zulip-feed)
 (require 'zulip-root)
 (require 'zulip-modes)
-(require 'zulip-evil)
 
 (defconst zulip-version "0.1.0"
   "Current emacs-zulip package version.")
@@ -121,5 +120,8 @@ access to the all-messages feed now that `zulip' opens the navigator."
     (user-error "No live Zulip account for %s" email)))
 
 (provide 'zulip)
+
+(with-eval-after-load 'evil
+  (require 'zulip-evil nil t))
 
 ;;; zulip.el ends here
