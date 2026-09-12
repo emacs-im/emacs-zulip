@@ -1,0 +1,133 @@
+#+title: emacs-zulip
+
+An Appkit-based, multi-account Zulip client for Emacs.
+
+* Setup
+
+Requires Emacs 32.0 and Appkit 0.3.0.  Markdown composition needs Appkit's pinned
+~markdown~ and ~markdown-inline~ Tree-sitter grammars; check or install explicitly:
+
+#+begin_src emacs-lisp
+(appkit-markup-markdown-ts-ready-p)
+(appkit-markup-markdown-ts-install-grammars)
+#+end_src
+
+Startup, preview, and send never invoke the installer.
+
+Configure account metadata, not API keys:
+
+#+begin_src emacs-lisp
+(setq zulip-accounts
+      '((:name "work"
+         :server "https://chat.example.com"
+         :email "person@example.com")
+        (:name "community"
+         :server "https://chat.example.org:8443"
+         :email "person@example.org")))
+#+end_src
+
+Servers must be HTTPS origins without credentials, path, query, or fragment.
+Names and normalized ~(server, email)~ identities must be unique.
+
+API keys come from ~auth-source~.  For example, in encrypted =~/.authinfo.gpg=:
+
+#+begin_example
+machine chat.example.com login person@example.com port zulip password API_KEY
+machine chat.example.org login person@example.org port zulip-8443 password API_KEY
+#+end_example
+
+Default HTTPS uses service ~zulip~; a non-default origin port uses ~zulip-PORT~.
+Lookup requires the exact host, email, and service tuple, excluding unrelated
+web credentials.  Backends are selected through ~auth-sources~.
+
+Run ~M-x zulip~: one configured account is selected directly, several offer
+completion, and none prompts for server and email.  The root opens while
+registration runs in the background.
+
+* Boundaries
+
+- Each normalized account owns one Appkit App and its canonical ~zulip-account~
+  model.  Creating an account performs no network I/O; connecting starts an
+  App-owned Source for registration, consecutive long polling, retry, and
+  expired-queue replacement.  Results carry the exact account, App, and
+  generation; stopping or reconnecting revokes old transport and retry authority.
+  A Source that has not been enabled means offline, not connecting.
+- Navigator and narrow Generated Surfaces have stable account-scoped identities.
+  Rendering performs no I/O.  Surface HTTP Effects own history, message actions,
+  and edits; request and owner fencing prevents late history responses from
+  crossing Surface replacements or history generations.
+- Stopping revokes Surface authority but preserves the host buffer and draft.
+  Reopening reuses only an unattached, package-owned host with the same account
+  and narrow, retaining its derived major mode, structured draft, and active codec.
+- Topic hydration is a root-Surface-owned bounded FIFO with channel
+  deduplication; detached schedulers cannot land results or start queued work.
+  Avatar Resources have account-scoped decoded images and Appkit-managed
+  acquisition/cancellation; credentials go only to same-origin realm URLs.
+- API keys enter the live account only after lookup.  Its owned copy is erased
+  on credential replacement or session stop, and never appears in Customize,
+  completion labels, buffer names, or status messages.
+- Message IDs are opaque decimal strings at state and Surface boundaries,
+  never Emacs numbers for identity or ordering.  For endpoints requiring JSON
+  integers, the HTTP adapter validates the strings and emits numeric tokens
+  directly, without a numeric round-trip.
+- Optimistic sends are App-owned and may settle after their feed closes.
+  A ~local-*~ row is idempotently promoted to the server ID whether the event or
+  HTTP response arrives first; retrying a failed row preserves its local identity.
+- Auto-read only submits observed, unread, server-backed messages in the current
+  contiguous history window, never across gaps.  Explicit unread suppresses
+  immediate reversal until deliberate observation; ~zulip-auto-mark-read~ can
+  disable auto-read.
+
+* Composition and media limits
+
+Only topic and exact-participant direct-message narrows have an unambiguous
+send destination and a composer.  Combined, channel, mention, starred, and
+search feeds have none.
+
+~zulip-compose-codecs~ defaults to ~(markdown org plain)~.  Markdown and Org
+parse into one immutable Appkit Document capture shared by preview, optimistic
+display, and Zulip-compatible Markdown output.  Markdown uses Tree-sitter
+without enabling ~markdown-ts-mode~, embedded language modes, Font Lock, or
+user hooks; Org uses ~org-element~ without enabling Org mode, Babel, Font Lock,
+or user hooks.  Unsupported conversions, such as Org underline to Markdown,
+are rejected rather than silently flattened.
+
+Structured ~@Name~ mentions emit stable ID-qualified Zulip syntax.  Editing
+uses server-supplied raw Markdown and snapshots the rich draft; completing or
+cancelling restores that draft and its prior codec.
+
+Server-rendered HTML is parsed with libxml into Appkit Documents, not SHR.
+Zulip objects retain typed semantics and visible fallbacks, with links and
+navigation exposed as native Appkit actions.  Current client adapter limits:
+
+- Inline images and embeds are safe link placeholders, not acquired in-buffer.
+- Spoiler content remains visible; per-Surface reveal state is not implemented.
+- Tables and unsupported provider blocks use semantic text fallbacks.
+- Uploads and attachment previews are not implemented.
+- Realm/custom emoji catalogs and image-backed reactions are not implemented;
+  completion covers Unicode emoji only.
+
+* Source entrypoints
+
+Commands and bindings live with their implementation rather than in this README:
+[[file:zulip.el][account entrypoints]], [[file:zulip-root.el][navigator]],
+[[file:zulip-feed.el][feeds]], [[file:zulip-modes.el][modes and composer bindings]], and
+[[file:zulip-transient.el][message actions]].  See [[file:zulip-customize.el][options]] and
+[[file:zulip-evil.el][optional Evil integration]] for customization.
+
+* Development
+
+Developed beside ~appkit.el~.  Install the local Appkit build, recompile, and test:
+
+#+begin_src sh
+eask run script test-local
+#+end_src
+
+For a prepared sandbox:
+
+#+begin_src sh
+eask test ert test/*.el
+#+end_src
+
+ERT fixtures use isolated account Apps and Surfaces with synthetic transports;
+they neither resolve user credentials nor connect to a Zulip server.
